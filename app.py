@@ -60,7 +60,7 @@ class Config:
     
     # App Keep-Alive (for Render free tier)
     SELF_PING_INTERVAL_MINUTES: int = 10
-    APP_URL: str = field(default_factory=lambda: load_app_url())  # Load from storage
+    
     
     # Data Storage
     DATA_DIR: str = "data"
@@ -97,55 +97,19 @@ class Config:
         return cls()
 
 def load_app_url():
-    """Load app URL from file or ask user"""
-    url_file = Path("data/app_url.txt")
-    
-    if url_file.exists():
-        with open(url_file, 'r') as f:
-            url = f.read().strip()
-            if url and validate_url(url):
-                return url
-    
-    # Ask for URL
-    print("\n" + "="*60)
-    print("🌐 RENDER APP URL SETUP")
-    print("="*60)
-    print("This app needs to ping itself to stay alive on Render's free tier.")
-    print("Please enter your Render app URL (e.g., https://your-app.onrender.com)")
-    print("This will only be asked once.")
-    print("-"*60)
-    
-    while True:
-        url = input("Enter your Render app URL: ").strip()
-        
-        if not url:
-            print("❌ URL cannot be empty. Try again.")
-            continue
-        
-        if not url.startswith(('http://', 'https://')):
-            url = f"https://{url}"
-        
-        if validate_url(url):
-            # Save URL
-            url_file.parent.mkdir(exist_ok=True)
-            with open(url_file, 'w') as f:
-                f.write(url)
-            
-            print(f"✅ URL saved successfully: {url}")
-            print("The app will now ping this URL every 10 minutes to stay awake.")
-            print("="*60 + "\n")
-            
+    """Ultra-simple URL detection for Render"""
+    # Render provides these environment variables automatically
+    if 'RENDER' in os.environ:
+        url = os.environ.get('RENDER_EXTERNAL_URL', '')
+        if url:
             return url
-        else:
-            print("❌ Invalid URL format. Please enter a valid URL (e.g., https://your-app.onrender.com)")
-
-def validate_url(url: str) -> bool:
-    """Validate URL format"""
-    try:
-        result = urlparse(url)
-        return all([result.scheme, result.netloc])
-    except:
-        return False
+        
+        # Fallback to service name construction
+        service_name = os.environ.get('RENDER_SERVICE_NAME', 'forex-scanner')
+        return f"https://{service_name}.onrender.com"
+    
+    # For local development
+    return "http://localhost:5000"
 
 # ============================================================================
 # RATE LIMITER
