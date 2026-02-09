@@ -49,7 +49,7 @@ class Config:
         "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
     ))
     NEWSAPI_KEY: str = field(default_factory=lambda: os.environ.get(
-        "NEWSAPI_KEY", "e973313ed2c142cb852101836f33a471"
+        "NEWSAPI_KEY", "1aa9d2e514c9469495338f3cf20be563"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
         "DERIV_TOKEN", "7LndOxnscxGr"
