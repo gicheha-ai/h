@@ -1,9 +1,8 @@
 Flask
+requests
 pandas
 numpy
-requests
 schedule
 websockets
-python-dotenv
-gunicorn
-websocket-client
+python-dateutil
+pytz

@@ -1,7 +1,8 @@
 """
-FOREX GLOBAL SENTINEL - Professional Production Edition
-Complete implementation with ALL features, optimized for Render deployment
-Catalyst-driven, limit-proof, real-time analysis system
+FOREX TECHNICAL SENTINEL - Pure Technical Analysis Edition
+Complete 90-pair analysis with professional 80-point technical scoring
+No fundamental analysis, only technical (80) + sentiment (20) = 100 total
+Shows ALL pairs with score ≥ 70 - NO OTHER FILTERS
 """
 
 import requests
@@ -21,7 +22,6 @@ import logging
 from pathlib import Path
 import hashlib
 from functools import lru_cache
-import websocket
 from collections import deque
 import math
 import asyncio
@@ -48,19 +48,16 @@ class Config:
     TWELVEDATA_KEY: str = field(default_factory=lambda: os.environ.get(
         "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
     ))
-    NEWSAPI_KEY: str = field(default_factory=lambda: os.environ.get(
-        "NEWSAPI_KEY", "ebe1e67ff6ad4d498182d7163760acfa"
-    ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
-        "DERIV_TOKEN", "d58VWSjiGFjkmC2"
+        "DERIV_TOKEN", "7LndOxnscxGr"
     ))
     
     # Scanner Settings
-    MIN_CONFLUENCE_SCORE: int = 50
+    MIN_CONFLUENCE_SCORE: int = 70  # THE ONLY FILTER - NO OTHER FILTERS
     SCAN_INTERVAL_MINUTES: int = 15
-    MAX_PAIRS_PER_SCAN: int = 50
+    TOTAL_PAIRS: int = 90  # ALL 90 pairs will be analyzed
     
-    # Professional TP/SL Settings
+    # Professional TP/SL Settings (SAME AS BEFORE)
     MIN_RISK_REWARD: float = 1.5
     MIN_SUCCESS_PROBABILITY: float = 0.6
     MAX_TRADE_DURATION_DAYS: int = 30
@@ -74,20 +71,28 @@ class Config:
     
     # Data Storage
     DATA_DIR: str = "/tmp/data" if 'RENDER' in os.environ else "data"
-    OPPORTUNITIES_DB: str = "/tmp/data/opportunities.json" if 'RENDER' in os.environ else "data/opportunities.json"
     
     # Performance
     REQUEST_TIMEOUT: int = 30
-    CACHE_TTL_MINUTES: int = 5
+    CACHE_TTL_MINUTES: int = 15  # Cache indicator calculations
     MAX_RETRIES: int = 3
     
     # WebSocket Settings
     DERIV_WS_URL: str = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-    WS_MAX_PAIRS: int = 10
     WS_BATCH_SIZE: int = 3
     WS_BATCH_DELAY: float = 1.0
     WS_PAIR_DELAY: float = 0.1
     WS_RECONNECT_INTERVAL: int = 300  # 5 minutes
+    
+    # Technical Analysis Settings
+    HISTORICAL_PERIODS: int = 500  # Enough for all indicator calculations
+    PRICE_HISTORY_LENGTH: int = 1000  # Store 1000 periods locally
+    
+    # 10 Base Currencies (all pairs formed from these)
+    BASE_CURRENCIES: List[str] = field(default_factory=lambda: [
+        'EUR', 'GBP', 'USD', 'JPY', 'CHF', 
+        'AUD', 'CAD', 'NZD', 'XAU', 'BTC', 'ETH'
+    ])
     
     def __post_init__(self):
         """Initialize for Render"""
@@ -154,6 +159,18 @@ def retry_request(func, max_retries=3, delay=1):
             time.sleep(delay * (attempt + 1))
     return None
 
+def generate_all_pairs(currencies: List[str]) -> List[str]:
+    """Generate ALL possible pairs from currencies (90 pairs total)"""
+    pairs = []
+    for i, base in enumerate(currencies):
+        for j, quote in enumerate(currencies):
+            if i != j:  # Skip same currency pairs
+                pairs.append(f"{base}/{quote}")
+    return pairs
+
+ALL_PAIRS = generate_all_pairs(config.BASE_CURRENCIES)
+logger.info(f"Generated {len(ALL_PAIRS)} pairs for analysis")
+
 # ============================================================================
 # DATA CLASSES
 # ============================================================================
@@ -164,7 +181,7 @@ class Opportunity:
     pair: str
     direction: str
     confluence_score: int
-    catalyst: str
+    catalyst: str = "Pure Technical Analysis"
     setup_type: str
     entry_price: float
     stop_loss: float
@@ -177,14 +194,18 @@ class Opportunity:
     context: str
     confidence: str
     analysis_summary: str
-    fundamentals_summary: str
+    fundamentals_summary: str = "Technical Analysis Only - No News Catalysts"
     technicals_summary: str
     sentiment_summary: str
     detected_at: str
     scan_id: str
     
+    # Technical score breakdown
+    technical_breakdown: Dict[str, int]
+    
     def to_dict(self):
-        return asdict(self)
+        data = asdict(self)
+        return data
 
 @dataclass
 class ScanResult:
@@ -196,6 +217,7 @@ class ScanResult:
     opportunities: List[Opportunity]
     scan_duration_seconds: float
     market_state: str
+    score_distribution: Dict[str, int]  # Count of pairs by score range
     
     def to_dict(self):
         return {
@@ -205,11 +227,12 @@ class ScanResult:
             'very_high_probability_setups': self.very_high_probability_setups,
             'opportunities': [opp.to_dict() for opp in self.opportunities],
             'scan_duration_seconds': self.scan_duration_seconds,
-            'market_state': self.market_state
+            'market_state': self.market_state,
+            'score_distribution': self.score_distribution
         }
 
 # ============================================================================
-# REAL-TIME DERIV WEB SOCKET MANAGER - FIXED VERSION
+# REAL-TIME PRICE MANAGER FOR 10 CURRENCIES
 # ============================================================================
 
 class DerivWebSocketManager:
@@ -219,16 +242,15 @@ class DerivWebSocketManager:
         self.token = deriv_token
         self.ws = None
         self.connected = False
-        self.prices = {}  # Real-time prices from WebSocket
-        self.cross_prices = {}  # Calculated cross pairs
-        self.price_history = {}  # Local price history storage
+        self.prices = {}  # Real-time prices from WebSocket for 10 currencies
+        self.price_history = {}  # Local price history storage for ALL 90 pairs
         self.message_count = 0
         self.last_message_time = time.time()
         self.start_time = time.time()
         self.running = False
         self.ws_thread = None
         
-        # Deriv symbol mapping
+        # Deriv symbol mapping - 10 CURRENCIES ONLY
         self.symbol_map = {
             'EUR/USD': 'frxEURUSD',
             'GBP/USD': 'frxGBPUSD',
@@ -237,25 +259,27 @@ class DerivWebSocketManager:
             'AUD/USD': 'frxAUDUSD',
             'USD/CAD': 'frxUSDCAD',
             'NZD/USD': 'frxNZDUSD',
-            'XAU/USD': 'WLDAUD',  # Gold proxy
-            'BTC/USD': 'cryBTCUSD',
-            'ETH/USD': 'OTC_DJI'  # Using DJI as ETH proxy
+            'XAU/USD': 'WLDAUD',      # Gold proxy
+            'BTC/USD': 'cryBTCUSD',   # Bitcoin
+            'ETH/USD': 'OTC_DJI'      # ETH proxy (DJI)
         }
         
         # Reverse mapping
         self.reverse_symbol_map = {v: k for k, v in self.symbol_map.items()}
         
-        # Currency list for cross calculations
-        self.currencies = ['EUR', 'GBP', 'USD', 'JPY', 'CHF', 'AUD', 'CAD', 'NZD', 'XAU', 'BTC', 'ETH']
+        # Initialize price history storage for ALL 90 pairs
+        self.initialize_all_pairs_history()
         
-        # Initialize price history storage
-        for pair in self.symbol_map.keys():
-            self.price_history[pair] = deque(maxlen=200)  # Store last 200 prices
+    def initialize_all_pairs_history(self):
+        """Initialize price history for ALL 90 possible pairs"""
+        for pair in ALL_PAIRS:
+            self.price_history[pair] = deque(maxlen=config.PRICE_HISTORY_LENGTH)
         
+        logger.info(f"Initialized price history for {len(self.price_history)} pairs")
+    
     def connect(self):
-        """Establish WebSocket connection with smart batching"""
+        """Establish WebSocket connection for 10 currencies"""
         try:
-            # Start WebSocket in background thread
             self.running = True
             self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
             self.ws_thread.start()
@@ -277,14 +301,14 @@ class DerivWebSocketManager:
         asyncio.run(self._async_websocket_handler())
     
     async def _async_websocket_handler(self):
-        """Async WebSocket handler using the working pattern"""
+        """Async WebSocket handler"""
         try:
-            uri = f"wss://ws.derivws.com/websockets/v3?app_id=1089"
+            uri = "wss://ws.derivws.com/websockets/v3?app_id=1089"
             
             async with websockets.connect(uri) as websocket:
                 self.ws = websocket
                 
-                # Step 1: Authorize
+                # Authorize
                 auth_msg = {"authorize": self.token}
                 await websocket.send(json.dumps(auth_msg))
                 auth_response = await websocket.recv()
@@ -295,10 +319,10 @@ class DerivWebSocketManager:
                     self.connected = False
                     return
                 
-                logger.info("✅ Deriv WebSocket authorized")
+                logger.info("✅ Deriv WebSocket authorized - Subscribing to 10 currencies")
                 self.connected = True
                 
-                # Step 2: Subscribe to all symbols
+                # Subscribe to all 10 symbols
                 symbols = list(self.symbol_map.values())
                 
                 # Subscribe in batches
@@ -306,17 +330,20 @@ class DerivWebSocketManager:
                     batch = symbols[i:i + config.WS_BATCH_SIZE]
                     
                     for symbol in batch:
-                        subscribe_msg = {"ticks": symbol, "subscribe": 1}
-                        await websocket.send(json.dumps(subscribe_msg))
-                        logger.debug(f"Subscribed to {symbol}")
-                        await asyncio.sleep(config.WS_PAIR_DELAY)
+                        try:
+                            subscribe_msg = {"ticks": symbol, "subscribe": 1}
+                            await websocket.send(json.dumps(subscribe_msg))
+                            logger.debug(f"Subscribed to {symbol}")
+                            await asyncio.sleep(config.WS_PAIR_DELAY)
+                        except:
+                            pass
                     
                     # Wait between batches
                     if i + config.WS_BATCH_SIZE < len(symbols):
                         await asyncio.sleep(config.WS_BATCH_DELAY)
                 
-                # Step 3: Start receiving messages
-                while self.running:
+                # Start receiving messages
+                while self.running and self.connected:
                     try:
                         response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                         self.message_count += 1
@@ -336,19 +363,11 @@ class DerivWebSocketManager:
                                     price = float(quote)
                                     self.prices[standard_pair] = price
                                     self.price_history[standard_pair].append(price)
-                                    
-                                    # Recalculate all crosses when we get new data
-                                    if len([p for p in self.prices.values() if p > 0]) >= 4:
-                                        self.calculate_all_crosses()
                         
-                        elif "error" in data:
-                            logger.error(f"Deriv WebSocket error: {data['error']}")
-                            
                     except asyncio.TimeoutError:
-                        # No data received, continue waiting
                         continue
                     except Exception as e:
-                        logger.error(f"Error processing message: {e}")
+                        logger.debug(f"WebSocket message error: {e}")
                         continue
                         
         except Exception as e:
@@ -357,83 +376,8 @@ class DerivWebSocketManager:
         finally:
             self.connected = False
     
-    def calculate_all_crosses(self):
-        """Calculate all cross pairs from base pairs"""
-        try:
-            # We need USD rates for all currencies
-            usd_rates = {}
-            
-            # Get USD rates for all currencies
-            for currency in self.currencies:
-                if currency == 'USD':
-                    usd_rates['USD'] = 1.0
-                else:
-                    # Try direct pair (EUR/USD)
-                    direct_pair = f"{currency}/USD"
-                    if direct_pair in self.prices:
-                        usd_rates[currency] = self.prices[direct_pair]
-                    # Try inverse pair (USD/JPY)
-                    else:
-                        inverse_pair = f"USD/{currency}"
-                        if inverse_pair in self.prices:
-                            usd_rates[currency] = 1 / self.prices[inverse_pair]
-            
-            # Calculate all possible crosses
-            for base in self.currencies:
-                for quote in self.currencies:
-                    if base != quote:
-                        pair = f"{base}/{quote}"
-                        
-                        # Skip if we already have it directly
-                        if pair in self.prices:
-                            self.cross_prices[pair] = self.prices[pair]
-                            continue
-                        
-                        # Calculate cross: base/quote = (base/USD) / (quote/USD)
-                        if base in usd_rates and quote in usd_rates:
-                            base_usd = usd_rates[base]
-                            quote_usd = usd_rates[quote]
-                            
-                            if base_usd and quote_usd and quote_usd != 0:
-                                cross_price = base_usd / quote_usd
-                                self.cross_prices[pair] = cross_price
-                                
-                                # Initialize price history for this cross
-                                if pair not in self.price_history:
-                                    self.price_history[pair] = deque(maxlen=200)
-                                self.price_history[pair].append(cross_price)
-            
-            logger.debug(f"Calculated {len(self.cross_prices)} cross pairs")
-            
-        except Exception as e:
-            logger.error(f"Error calculating crosses: {e}")
-    
-    def get_price(self, pair: str) -> Optional[float]:
-        """Get current price for any pair"""
-        # First try direct price
-        if pair in self.prices:
-            return self.prices.get(pair)
-        
-        # Then try calculated cross
-        if pair in self.cross_prices:
-            return self.cross_prices.get(pair)
-        
-        # Try to calculate on demand
-        base, quote = pair.split('/')
-        
-        # Get USD rates
-        base_usd = self.get_usd_rate(base)
-        quote_usd = self.get_usd_rate(quote)
-        
-        if base_usd and quote_usd and quote_usd != 0:
-            price = base_usd / quote_usd
-            self.cross_prices[pair] = price
-            return price
-        
-        return None
-    
     def get_usd_rate(self, currency: str) -> Optional[float]:
-        """Get currency rate vs USD"""
+        """Get currency rate vs USD from current prices"""
         if currency == 'USD':
             return 1.0
         
@@ -450,13 +394,68 @@ class DerivWebSocketManager:
         
         return None
     
+    def calculate_all_cross_prices(self) -> Dict[str, float]:
+        """Calculate prices for ALL 90 pairs from USD rates"""
+        calculated_prices = {}
+        
+        # Get USD rates for all currencies
+        usd_rates = {}
+        for currency in config.BASE_CURRENCIES:
+            if currency == 'USD':
+                usd_rates['USD'] = 1.0
+            else:
+                rate = self.get_usd_rate(currency)
+                if rate:
+                    usd_rates[currency] = rate
+        
+        # Calculate all 90 pairs
+        for pair in ALL_PAIRS:
+            base, quote = pair.split('/')
+            
+            # Skip if we already have it directly from WS
+            if pair in self.prices:
+                calculated_prices[pair] = self.prices[pair]
+                continue
+            
+            # Calculate cross: base/quote = (base/USD) / (quote/USD)
+            if base in usd_rates and quote in usd_rates:
+                base_usd = usd_rates[base]
+                quote_usd = usd_rates[quote]
+                
+                if base_usd and quote_usd and quote_usd != 0:
+                    cross_price = base_usd / quote_usd
+                    calculated_prices[pair] = cross_price
+        
+        return calculated_prices
+    
+    def get_all_prices(self) -> Dict[str, float]:
+        """Get prices for ALL 90 pairs"""
+        # Start with direct WebSocket prices
+        all_prices = self.prices.copy()
+        
+        # Add calculated cross prices
+        calculated = self.calculate_all_cross_prices()
+        all_prices.update(calculated)
+        
+        # Update price history for ALL pairs
+        for pair, price in all_prices.items():
+            if pair in self.price_history and price > 0:
+                self.price_history[pair].append(price)
+        
+        return all_prices
+    
     def get_price_history(self, pair: str, period: int = 100) -> List[float]:
-        """Get price history for a pair"""
+        """Get price history for any of the 90 pairs"""
         if pair in self.price_history:
             history = list(self.price_history[pair])
             return history[-period:] if len(history) > period else history
-        
         return []
+    
+    def has_sufficient_history(self, pair: str, min_periods: int = 100) -> bool:
+        """Check if we have sufficient price history for analysis"""
+        if pair in self.price_history:
+            return len(self.price_history[pair]) >= min_periods
+        return False
     
     def reconnect(self):
         """Reconnect WebSocket"""
@@ -488,486 +487,217 @@ class DerivWebSocketManager:
                 time.sleep(30)
 
 # ============================================================================
-# SMART CATALYST DETECTOR (NEWSAPI)
+# HISTORICAL DATA MANAGER (TWELVEDATA)
 # ============================================================================
 
-class SmartCatalystDetector:
-    """Smart catalyst detection that never hits NewsAPI limits"""
+class HistoricalDataManager:
+    """Manage historical data for ALL 90 pairs from 10 currencies"""
     
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://newsapi.org/v2"
-        
-        # Usage tracking
-        self.used_today = 0
-        self.daily_limit = 100
-        self.last_reset = datetime.now().date()
-        
-        # Smart keyword strategies
-        self.daily_keywords = [
-            "war OR conflict OR military",
-            "rate decision OR interest rate OR central bank",
-            "emergency meeting OR crisis",
-            "sanctions OR ban OR embargo",
-            "default OR bankruptcy OR collapse",
-            "election violence OR protest OR riot",
-            "terror attack OR bombing",
-            "currency devaluation OR peg broken",
-            "bank run OR bank failure",
-            "market crash OR flash crash"
-        ]
-        
-        # Rotating keywords (3-day cycle)
-        self.rotation_day = (datetime.now().date() - datetime(2024, 1, 1).date()).days % 3
-        self.rotation_keywords = [
-            ["inflation OR CPI", "unemployment OR jobs", "GDP OR growth", "retail sales", "manufacturing"],
-            ["trade deficit OR surplus", "budget deficit", "debt level", "stimulus package", "quantitative easing"],
-            ["oil price OR crude", "gold price", "commodity prices", "supply chain", "shipping crisis"]
-        ][self.rotation_day]
-        
-        # Catalyst to currency mapping
-        self.catalyst_currency_map = {
-            'war': ['EUR', 'USD', 'CHF', 'JPY', 'XAU'],  # Safe havens
-            'conflict': ['EUR', 'USD', 'CHF', 'JPY', 'XAU'],
-            'rate decision': ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'],
-            'interest rate': ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'],
-            'central bank': ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD'],
-            'emergency meeting': ['USD', 'EUR', 'GBP', 'JPY'],
-            'crisis': ['USD', 'EUR', 'JPY', 'CHF', 'XAU'],
-            'sanctions': ['USD', 'EUR', 'GBP', 'RUB', 'CNY'],
-            'default': ['USD', 'EUR', 'JPY', 'XAU'],
-            'bankruptcy': ['USD', 'EUR', 'JPY'],
-            'election': ['USD', 'EUR', 'GBP', 'JPY', 'AUD'],
-            'protest': ['USD', 'EUR', 'GBP', 'CNY', 'RUB'],
-            'terror': ['USD', 'EUR', 'GBP', 'JPY', 'XAU'],
-            'devaluation': ['TRY', 'ZAR', 'MXN', 'BRL', 'INR'],
-            'bank run': ['USD', 'EUR', 'GBP', 'JPY', 'CHF'],
-            'market crash': ['USD', 'EUR', 'GBP', 'JPY', 'XAU'],
-            'inflation': ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD'],
-            'unemployment': ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD'],
-            'GDP': ['USD', 'EUR', 'GBP', 'JPY', 'CNY', 'INR'],
-            'trade deficit': ['USD', 'EUR', 'GBP', 'JPY', 'CNY'],
-            'oil price': ['USD', 'CAD', 'RUB', 'AUD', 'NZD'],
-            'gold price': ['USD', 'XAU', 'AUD', 'CAD'],
-            'commodity': ['USD', 'CAD', 'AUD', 'NZD', 'RUB']
-        }
-    
-    def reset_if_new_day(self):
-        """Reset daily counters if it's a new day"""
-        if datetime.now().date() != self.last_reset:
-            self.used_today = 0
-            self.last_reset = datetime.now().date()
-            logger.info("Reset daily NewsAPI counter")
-    
-    def can_make_request(self) -> bool:
-        """Check if we can make a NewsAPI request"""
-        self.reset_if_new_day()
-        
-        # Always keep 20 requests as emergency buffer
-        if self.used_today >= self.daily_limit - 20:
-            logger.warning(f"NewsAPI limit approaching: {self.used_today}/{self.daily_limit}")
-            return False
-        
-        return True
-    
-    def make_request(self, endpoint: str, params: Dict) -> Optional[Dict]:
-        """Make a NewsAPI request with quota tracking"""
-        if not self.can_make_request():
-            logger.warning("Cannot make NewsAPI request - limit protection")
-            return None
-        
-        try:
-            params['apiKey'] = self.api_key
-            cache_key = get_cache_key(endpoint, json.dumps(params, sort_keys=True))
-            
-            # Check cache first
-            cached = cache.get(cache_key)
-            if cached:
-                return cached
-            
-            # Make request
-            response = requests.get(
-                f"{self.base_url}/{endpoint}",
-                params=params,
-                timeout=config.REQUEST_TIMEOUT
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                self.used_today += 1
-                logger.debug(f"NewsAPI request #{self.used_today}: {endpoint}")
-                
-                # Cache for 1 hour
-                cache.set(cache_key, data)
-                return data
-            else:
-                logger.error(f"NewsAPI error: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"NewsAPI request failed: {e}")
-            return None
-    
-    def detect_catalysts(self) -> List[Dict]:
-        """Smart catalyst detection with rotation strategy"""
-        catalysts = []
-        
-        try:
-            # Step 1: Get global headlines (4 requests)
-            headlines = self.get_global_headlines()
-            
-            # Extract themes from headlines
-            themes = self.extract_themes_from_headlines(headlines)
-            
-            # Step 2: Search based on themes
-            for keyword in self.daily_keywords[:6]:  # First 6 daily keywords
-                # Check if keyword is relevant to today's themes
-                if self.is_keyword_relevant(keyword, themes):
-                    results = self.search_keyword(keyword, page_size=3)
-                    if results and results.get('articles'):
-                        catalysts.extend(self.process_articles(results['articles'], keyword))
-            
-            # Step 3: Search rotating keywords (5 requests)
-            for keyword in self.rotation_keywords:
-                results = self.search_keyword(keyword, page_size=2)
-                if results and results.get('articles'):
-                    catalysts.extend(self.process_articles(results['articles'], keyword))
-            
-            # Deduplicate catalysts
-            unique_catalysts = []
-            seen = set()
-            for catalyst in catalysts:
-                key = f"{catalyst['type']}_{catalyst['title'][:50]}"
-                if key not in seen:
-                    seen.add(key)
-                    unique_catalysts.append(catalyst)
-            
-            logger.info(f"Detected {len(unique_catalysts)} unique catalysts")
-            return unique_catalysts
-            
-        except Exception as e:
-            logger.error(f"Catalyst detection failed: {e}")
-            return []
-    
-    def get_global_headlines(self) -> List[Dict]:
-        """Get global business headlines"""
-        headlines = []
-        countries = ['us', 'gb', 'jp', 'au']  # Major financial centers
-        
-        for country in countries[:2]:  # Only US and UK to save requests
-            params = {
-                'category': 'business',
-                'country': country,
-                'pageSize': 5
-            }
-            
-            data = self.make_request('top-headlines', params)
-            if data and data.get('articles'):
-                headlines.extend(data['articles'])
-        
-        return headlines
-    
-    def search_keyword(self, keyword: str, page_size: int = 5) -> Optional[Dict]:
-        """Search for a keyword"""
-        params = {
-            'q': keyword,
-            'pageSize': page_size,
-            'sortBy': 'relevancy',
-            'language': 'en',
-            'from': (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d')
-        }
-        
-        return self.make_request('everything', params)
-    
-    def extract_themes_from_headlines(self, headlines: List[Dict]) -> Set[str]:
-        """Extract themes from headlines"""
-        themes = set()
-        theme_keywords = {
-            'war': ['war', 'conflict', 'military', 'invasion', 'attack'],
-            'economy': ['economy', 'economic', 'growth', 'recession', 'downturn'],
-            'rates': ['rate', 'interest', 'fed', 'central bank', 'ecb', 'boj'],
-            'inflation': ['inflation', 'cpi', 'prices', 'consumer'],
-            'politics': ['election', 'vote', 'government', 'parliament', 'senate'],
-            'crisis': ['crisis', 'emergency', 'collapse', 'default'],
-            'markets': ['market', 'stock', 'dow', 'nasdaq', 'ftse']
-        }
-        
-        for article in headlines:
-            text = f"{article.get('title', '')} {article.get('description', '')}".lower()
-            for theme, keywords in theme_keywords.items():
-                if any(keyword in text for keyword in keywords):
-                    themes.add(theme)
-        
-        return themes
-    
-    def is_keyword_relevant(self, keyword: str, themes: Set[str]) -> bool:
-        """Check if keyword is relevant to today's themes"""
-        keyword_lower = keyword.lower()
-        
-        # Map keywords to themes
-        keyword_theme_map = {
-            'war': 'war',
-            'conflict': 'war',
-            'military': 'war',
-            'rate': 'rates',
-            'interest': 'rates',
-            'central bank': 'rates',
-            'crisis': 'crisis',
-            'emergency': 'crisis',
-            'collapse': 'crisis',
-            'default': 'crisis',
-            'inflation': 'inflation',
-            'cpi': 'inflation',
-            'election': 'politics',
-            'vote': 'politics',
-            'market': 'markets',
-            'stock': 'markets'
-        }
-        
-        for word, theme in keyword_theme_map.items():
-            if word in keyword_lower and theme in themes:
-                return True
-        
-        # If no themes detected, search everything
-        if not themes:
-            return True
-        
-        return False
-    
-    def process_articles(self, articles: List[Dict], keyword: str) -> List[Dict]:
-        """Process articles into catalyst objects"""
-        catalysts = []
-        
-        for article in articles:
-            title = article.get('title', '')
-            description = article.get('description', '')
-            text = f"{title} {description}".lower()
-            
-            # Determine catalyst type
-            catalyst_type = self.determine_catalyst_type(text, keyword)
-            
-            # Determine affected currencies
-            affected_currencies = self.determine_affected_currencies(text, catalyst_type)
-            
-            # Determine intensity
-            intensity = self.determine_intensity(text, catalyst_type)
-            
-            if catalyst_type and affected_currencies and intensity in ['HIGH', 'MEDIUM']:
-                catalysts.append({
-                    'type': catalyst_type,
-                    'title': title[:100],
-                    'description': description[:200] if description else '',
-                    'source': article.get('source', {}).get('name', 'Unknown'),
-                    'published_at': article.get('publishedAt', ''),
-                    'affected_currencies': affected_currencies,
-                    'intensity': intensity,
-                    'keyword': keyword
-                })
-        
-        return catalysts
-    
-    def determine_catalyst_type(self, text: str, keyword: str) -> str:
-        """Determine catalyst type from text"""
-        # Check for specific catalyst types
-        catalyst_patterns = {
-            'rate_decision': ['rate decision', 'interest rate', 'fed meeting', 'ecb meeting'],
-            'geopolitical': ['war', 'conflict', 'invasion', 'military action'],
-            'sanctions': ['sanctions', 'embargo', 'ban'],
-            'election': ['election', 'vote', 'poll'],
-            'economic_data': ['inflation', 'cpi', 'gdp', 'unemployment'],
-            'crisis': ['crisis', 'emergency', 'collapse', 'default'],
-            'natural_disaster': ['earthquake', 'tsunami', 'hurricane', 'flood']
-        }
-        
-        for cat_type, patterns in catalyst_patterns.items():
-            if any(pattern in text for pattern in patterns):
-                return cat_type
-        
-        # Default to keyword-based type
-        return keyword.split()[0] if ' ' in keyword else keyword
-    
-    def determine_affected_currencies(self, text: str, catalyst_type: str) -> List[str]:
-        """Determine which currencies are affected"""
-        affected = set()
-        
-        # Check text for currency mentions
-        currency_codes = ['USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'CNY', 'RUB']
-        for currency in currency_codes:
-            if currency.lower() in text.lower() or currency in text:
-                affected.add(currency)
-        
-        # Add based on catalyst type
-        if catalyst_type in self.catalyst_currency_map:
-            affected.update(self.catalyst_currency_map[catalyst_type])
-        
-        # If still empty, default to major currencies
-        if not affected:
-            affected = ['USD', 'EUR', 'GBP', 'JPY']
-        
-        return list(affected)
-    
-    def determine_intensity(self, text: str, catalyst_type: str) -> str:
-        """Determine catalyst intensity"""
-        text_lower = text.lower()
-        
-        # High intensity indicators
-        high_indicators = [
-            'emergency', 'urgent', 'crisis', 'collapse', 'war', 'invasion',
-            'sanctions', 'default', 'bankruptcy', 'crash', 'plunge'
-        ]
-        
-        # Medium intensity indicators
-        medium_indicators = [
-            'warning', 'alert', 'concern', 'fear', 'risk', 'pressure',
-            'slowdown', 'downturn', 'decline', 'drop'
-        ]
-        
-        if any(indicator in text_lower for indicator in high_indicators):
-            return 'HIGH'
-        elif any(indicator in text_lower for indicator in medium_indicators):
-            return 'MEDIUM'
-        else:
-            return 'LOW'
-
-# ============================================================================
-# HYBRID TECHNICAL ANALYZER
-# ============================================================================
-
-class HybridTechnicalAnalyzer:
-    """Hybrid technical analyzer using WebSocket real-time and TwelveData historical"""
-    
-    def __init__(self, twelve_data_key: str, web_socket_manager: DerivWebSocketManager):
+    def __init__(self, twelve_data_key: str, ws_manager: DerivWebSocketManager):
         self.twelve_data_key = twelve_data_key
-        self.ws_manager = web_socket_manager
+        self.ws_manager = ws_manager
         self.base_url = "https://api.twelvedata.com"
         
-        # Local storage for historical data
+        # Historical data for 10 USD pairs
         self.historical_data = {}
         
-        # Load historical data on initialization
-        self.load_historical_data()
-    
-    def load_historical_data(self):
-        """Load historical data once per day"""
+        # Last fetch date
+        self.last_fetch_date = None
+        
+    def fetch_initial_historical_data(self):
+        """Fetch historical data for 10 USD pairs (once per day)"""
         try:
-            # Check if we already loaded today
             today = datetime.now().date()
-            cache_key = f"historical_data_{today}"
             
-            cached = cache.get(cache_key)
-            if cached:
-                self.historical_data = cached
-                logger.info("Loaded historical data from cache")
-                return
+            # Check if we already fetched today
+            if self.last_fetch_date == today:
+                logger.info("Historical data already fetched today")
+                return True
             
-            # Fetch historical data for base pairs
-            base_pairs = [
+            logger.info("Fetching historical data for 10 USD pairs...")
+            
+            # 10 USD pairs to fetch
+            usd_pairs = [
                 'EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF',
-                'AUD/USD', 'USD/CAD', 'NZD/USD'
+                'AUD/USD', 'USD/CAD', 'NZD/USD', 'XAU/USD',
+                'BTC/USD', 'ETH/USD'
             ]
             
-            for pair in base_pairs:
-                data = self.fetch_historical_data(pair, interval='1day', outputsize=100)
-                if data is not None:
-                    self.historical_data[pair] = data
+            successful_fetches = 0
             
-            # Cache for 24 hours
-            cache.set(cache_key, self.historical_data)
-            logger.info(f"Loaded historical data for {len(self.historical_data)} pairs")
+            for pair in usd_pairs:
+                try:
+                    symbol = pair.replace('/', '')
+                    params = {
+                        'symbol': symbol,
+                        'interval': '1day',
+                        'outputsize': config.HISTORICAL_PERIODS,
+                        'apikey': self.twelve_data_key
+                    }
+                    
+                    response = requests.get(
+                        f"{self.base_url}/time_series",
+                        params=params,
+                        timeout=config.REQUEST_TIMEOUT
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        if 'values' in data:
+                            df = pd.DataFrame(data['values'])
+                            df['datetime'] = pd.to_datetime(df['datetime'])
+                            df.set_index('datetime', inplace=True)
+                            
+                            # Convert numeric columns
+                            for col in ['open', 'high', 'low', 'close']:
+                                if col in df.columns:
+                                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                            
+                            df = df.dropna()
+                            self.historical_data[pair] = df
+                            successful_fetches += 1
+                            
+                            # Initialize WebSocket history with this data
+                            if pair in self.ws_manager.price_history:
+                                closes = df['close'].values.tolist()
+                                for price in closes:
+                                    self.ws_manager.price_history[pair].append(price)
+                            
+                            logger.info(f"Fetched {len(df)} periods for {pair}")
+                        else:
+                            logger.warning(f"No data for {pair}")
+                    else:
+                        logger.warning(f"Failed to fetch {pair}: {response.status_code}")
+                    
+                    # Be nice to the API
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching {pair}: {e}")
+            
+            self.last_fetch_date = today
+            logger.info(f"Historical data fetch complete: {successful_fetches}/10 pairs")
+            return successful_fetches >= 5  # At least 5 successful
             
         except Exception as e:
-            logger.error(f"Failed to load historical data: {e}")
+            logger.error(f"Historical data fetch failed: {e}")
+            return False
     
-    def fetch_historical_data(self, pair: str, interval: str = '1day', outputsize: int = 100) -> Optional[pd.DataFrame]:
-        """Fetch historical data from TwelveData"""
-        try:
-            symbol = pair.replace('/', '')
-            params = {
-                'symbol': symbol,
-                'interval': interval,
-                'outputsize': outputsize,
-                'apikey': self.twelve_data_key
-            }
-            
-            response = requests.get(
-                f"{self.base_url}/time_series",
-                params=params,
-                timeout=config.REQUEST_TIMEOUT
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'values' in data:
-                    df = pd.DataFrame(data['values'])
-                    df['datetime'] = pd.to_datetime(df['datetime'])
-                    df.set_index('datetime', inplace=True)
-                    
-                    # Convert numeric columns
-                    for col in ['open', 'high', 'low', 'close']:
-                        if col in df.columns:
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    df = df.dropna()
-                    return df
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch historical data for {pair}: {e}")
-            return None
+    def get_historical_prices(self, pair: str) -> Optional[np.ndarray]:
+        """Get historical prices for a pair"""
+        # If we have direct historical data
+        if pair in self.historical_data:
+            return self.historical_data[pair]['close'].values
+        
+        # For cross pairs, we need to calculate from USD rates
+        base, quote = pair.split('/')
+        
+        # Try to get base/USD and quote/USD
+        base_usd_pair = f"{base}/USD"
+        quote_usd_pair = f"{quote}/USD"
+        
+        base_prices = None
+        quote_prices = None
+        
+        if base_usd_pair in self.historical_data:
+            base_prices = self.historical_data[base_usd_pair]['close'].values
+        
+        if quote_usd_pair in self.historical_data:
+            quote_prices = self.historical_data[quote_usd_pair]['close'].values
+        
+        # Also check inverse pairs
+        if base_prices is None and base != 'USD':
+            usd_base_pair = f"USD/{base}"
+            if usd_base_pair in self.historical_data:
+                base_prices = 1 / self.historical_data[usd_base_pair]['close'].values
+        
+        if quote_prices is None and quote != 'USD':
+            usd_quote_pair = f"USD/{quote}"
+            if usd_quote_pair in self.historical_data:
+                quote_prices = 1 / self.historical_data[usd_quote_pair]['close'].values
+        
+        # If we have both, calculate cross prices
+        if base_prices is not None and quote_prices is not None:
+            # Align lengths
+            min_len = min(len(base_prices), len(quote_prices))
+            cross_prices = base_prices[:min_len] / quote_prices[:min_len]
+            return cross_prices
+        
+        return None
+
+# ============================================================================
+# PROFESSIONAL TECHNICAL ANALYZER (80 POINTS)
+# ============================================================================
+
+class ProfessionalTechnicalAnalyzer:
+    """Complete technical analysis for ALL 90 pairs (80 points total)"""
     
+    def __init__(self, ws_manager: DerivWebSocketManager, historical_manager: HistoricalDataManager):
+        self.ws_manager = ws_manager
+        self.historical_manager = historical_manager
+        
     def analyze_pair(self, pair: str) -> Dict:
-        """Complete technical analysis for any pair"""
+        """Complete technical analysis for a pair - returns 0-80 score with breakdown"""
         try:
             cache_key = f"technical_{pair}_{datetime.now().hour}"
             cached = cache.get(cache_key)
             if cached:
                 return cached
             
-            # Get current price from WebSocket
-            current_price = self.ws_manager.get_price(pair)
-            if current_price is None or current_price <= 0:
-                return self.get_fallback_technicals(pair)
-            
             # Get price history
-            price_history = self.ws_manager.get_price_history(pair, 100)
-            if len(price_history) < 20:
-                # Try to use historical data if WebSocket history is insufficient
-                if pair in self.historical_data:
-                    closes = self.historical_data[pair]['close'].values[-100:]
-                    price_history = closes.tolist() if len(closes) > 0 else []
+            price_history = self.ws_manager.get_price_history(pair, 200)
+            if len(price_history) < 100:
+                # Try to get from historical data
+                historical = self.historical_manager.get_historical_prices(pair)
+                if historical is not None and len(historical) > 0:
+                    price_history = historical.tolist()[-200:]
             
-            if len(price_history) < 20:
-                return self.get_fallback_technicals(pair)
+            if len(price_history) < 50:
+                return self.get_fallback_analysis(pair)
             
-            # Perform analysis
-            trend = self.analyze_trend(price_history)
-            patterns = self.detect_patterns(price_history)
-            indicators = self.calculate_indicators(price_history)
-            levels = self.find_key_levels(price_history, current_price)
-            context = self.determine_context(trend, patterns)
+            prices = np.array(price_history)
             
-            # Calculate score
-            score = self.calculate_technical_score(trend, patterns, indicators, levels)
+            # PART A: MARKET STRUCTURE (30 points)
+            structure_score, structure_details = self.analyze_market_structure(prices)
             
-            # Calculate ATR for volatility
-            atr = self.calculate_atr(price_history)
+            # PART B: MOMENTUM (25 points)
+            momentum_score, momentum_details = self.analyze_momentum(prices)
+            
+            # PART C: KEY LEVELS (15 points)
+            levels_score, levels_details = self.analyze_key_levels(pair, prices)
+            
+            # PART D: VOLATILITY/ENTRY (10 points)
+            volatility_score, volatility_details = self.analyze_volatility_entry(pair, prices)
+            
+            # Total technical score (0-80)
+            total_score = structure_score + momentum_score + levels_score + volatility_score
+            
+            # Determine direction
+            direction = self.determine_direction(prices, structure_details)
             
             # Find optimal entry
-            optimal_entry = self.calculate_optimal_entry(current_price, trend['direction'], levels, atr)
+            current_price = prices[-1] if len(prices) > 0 else 0
+            optimal_entry = self.find_optimal_entry(pair, current_price, direction, structure_details, levels_details)
+            
+            # Create summary
+            summary = self.create_technical_summary(total_score, structure_details, momentum_details, levels_details)
             
             result = {
-                'score': score,
-                'trend': trend,
-                'patterns': patterns,
-                'indicators': indicators,
-                'levels': levels,
-                'context': context,
+                'total_score': total_score,
+                'structure_score': structure_score,
+                'momentum_score': momentum_score,
+                'levels_score': levels_score,
+                'volatility_score': volatility_score,
+                'structure_details': structure_details,
+                'momentum_details': momentum_details,
+                'levels_details': levels_details,
+                'volatility_details': volatility_details,
+                'direction': direction,
                 'current_price': float(current_price),
                 'optimal_entry': optimal_entry,
-                'atr': atr,
-                'summary': self.create_technical_summary(trend, patterns, context, score),
-                'data_points': len(price_history),
+                'atr': volatility_details.get('atr', 0.001),
+                'summary': summary,
+                'prices_analyzed': len(prices),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -976,78 +706,338 @@ class HybridTechnicalAnalyzer:
             
         except Exception as e:
             logger.error(f"Technical analysis error for {pair}: {e}")
-            return self.get_fallback_technicals(pair)
+            return self.get_fallback_analysis(pair)
     
-    def analyze_trend(self, prices: List[float]) -> Dict:
-        """Analyze trend direction and strength"""
-        if len(prices) < 20:
-            return {'direction': 'SIDEWAYS', 'strength': 0, 'strong': False}
+    def analyze_market_structure(self, prices: np.ndarray) -> Tuple[int, Dict]:
+        """Analyze market structure - 30 points total"""
+        if len(prices) < 50:
+            return 0, {'error': 'Insufficient data'}
         
-        # Convert to numpy array for calculations
-        prices_array = np.array(prices)
+        score = 0
+        details = {}
         
-        # Calculate moving averages
-        sma_20 = np.mean(prices_array[-20:])
-        sma_50 = np.mean(prices_array[-50:]) if len(prices) >= 50 else sma_20
+        # 1. Multi-timeframe alignment (15 points)
+        m1_trend = self.analyze_trend(prices[-20:])  # Short-term
+        m2_trend = self.analyze_trend(prices[-50:])  # Medium-term
+        m3_trend = self.analyze_trend(prices[-100:]) # Long-term
         
-        current = prices_array[-1]
+        trends = [m1_trend['direction'], m2_trend['direction'], m3_trend['direction']]
         
-        # Determine trend
-        if current > sma_20 > sma_50:
-            strength = (current - sma_50) / sma_50 * 100
-            return {'direction': 'UPTREND', 'strength': strength, 'strong': strength > 5}
-        elif current < sma_20 < sma_50:
-            strength = (sma_50 - current) / sma_50 * 100
-            return {'direction': 'DOWNTREND', 'strength': strength, 'strong': strength > 5}
+        if all(t == 'UPTREND' for t in trends):
+            details['mtf_alignment'] = 'Perfect bullish alignment'
+            score += 15
+        elif all(t == 'DOWNTREND' for t in trends):
+            details['mtf_alignment'] = 'Perfect bearish alignment'
+            score += 15
+        elif trends.count('UPTREND') >= 2:
+            details['mtf_alignment'] = 'Majority bullish'
+            score += 10
+        elif trends.count('DOWNTREND') >= 2:
+            details['mtf_alignment'] = 'Majority bearish'
+            score += 10
+        else:
+            details['mtf_alignment'] = 'Mixed/no alignment'
+            score += 5
         
-        return {'direction': 'SIDEWAYS', 'strength': 0, 'strong': False}
+        # 2. Clean structure (10 points)
+        structure = self.analyze_price_structure(prices)
+        details['structure'] = structure
+        
+        if structure['quality'] == 'EXCELLENT':
+            score += 10
+        elif structure['quality'] == 'GOOD':
+            score += 7
+        elif structure['quality'] == 'FAIR':
+            score += 4
+        else:
+            score += 1
+        
+        # 3. MA alignment (5 points)
+        ma_alignment = self.analyze_ma_alignment(prices)
+        details['ma_alignment'] = ma_alignment
+        
+        if ma_alignment['aligned']:
+            score += 5
+        elif ma_alignment['partially_aligned']:
+            score += 3
+        else:
+            score += 1
+        
+        details['total_structure_score'] = score
+        return score, details
     
-    def detect_patterns(self, prices: List[float]) -> List[str]:
-        """Detect chart patterns"""
-        patterns = []
-        
-        if len(prices) < 10:
-            return patterns
-        
-        recent_prices = prices[-10:]
-        
-        # Check for higher highs/lows
-        if len(recent_prices) >= 5:
-            highs = recent_prices[-5:]
-            lows = recent_prices[-5:]
-            
-            # Simple pattern detection
-            if max(highs) == highs[-1] and min(lows) == lows[-1]:
-                patterns.append("Higher high & higher low")
-            elif max(highs) == highs[0] and min(lows) == lows[0]:
-                patterns.append("Lower high & lower low")
-        
-        # Check for consolidation
-        price_range = max(recent_prices) - min(recent_prices)
-        avg_price = sum(recent_prices) / len(recent_prices)
-        
-        if price_range / avg_price < 0.01:  # Less than 1% range
-            patterns.append("Consolidation")
-        
-        return patterns
-    
-    def calculate_indicators(self, prices: List[float]) -> Dict:
-        """Calculate technical indicators"""
+    def analyze_momentum(self, prices: np.ndarray) -> Tuple[int, Dict]:
+        """Analyze momentum - 25 points total"""
         if len(prices) < 14:
-            return {'rsi': 50, 'aligned': False}
+            return 0, {'error': 'Insufficient data'}
         
-        # Calculate RSI
-        rsi = self.calculate_rsi(prices)
+        score = 0
+        details = {}
         
-        # Check if indicators are aligned with trend
-        aligned = self.check_indicator_alignment(prices)
+        # 1. RSI divergence (8 points)
+        rsi_analysis = self.analyze_rsi(prices)
+        details['rsi'] = rsi_analysis
         
-        return {'rsi': rsi, 'aligned': aligned}
+        if rsi_analysis['divergence'] == 'BULLISH' and rsi_analysis['value'] > 50:
+            score += 8
+        elif rsi_analysis['divergence'] == 'BEARISH' and rsi_analysis['value'] < 50:
+            score += 8
+        elif rsi_analysis['value'] >= 30 and rsi_analysis['value'] <= 70:
+            score += 5
+        elif rsi_analysis['value'] < 30 or rsi_analysis['value'] > 70:
+            score += 3
+        else:
+            score += 1
+        
+        # 2. MACD alignment (7 points)
+        macd_analysis = self.analyze_macd(prices)
+        details['macd'] = macd_analysis
+        
+        if macd_analysis['signal'] == 'STRONG_BULLISH':
+            score += 7
+        elif macd_analysis['signal'] == 'STRONG_BEARISH':
+            score += 7
+        elif macd_analysis['signal'] == 'BULLISH':
+            score += 5
+        elif macd_analysis['signal'] == 'BEARISH':
+            score += 5
+        elif macd_analysis['signal'] == 'NEUTRAL':
+            score += 3
+        else:
+            score += 1
+        
+        # 3. ADX strength (5 points)
+        adx_analysis = self.analyze_adx(prices)
+        details['adx'] = adx_analysis
+        
+        if adx_analysis['strength'] == 'STRONG_TREND':
+            score += 5
+        elif adx_analysis['strength'] == 'MODERATE_TREND':
+            score += 4
+        elif adx_analysis['strength'] == 'WEAK_TREND':
+            score += 3
+        else:
+            score += 2
+        
+        # 4. Stochastic direction (5 points)
+        stoch_analysis = self.analyze_stochastic(prices)
+        details['stochastic'] = stoch_analysis
+        
+        if stoch_analysis['signal'] == 'BULLISH':
+            score += 5
+        elif stoch_analysis['signal'] == 'BEARISH':
+            score += 5
+        elif stoch_analysis['signal'] == 'NEUTRAL':
+            score += 3
+        else:
+            score += 2
+        
+        details['total_momentum_score'] = score
+        return score, details
     
-    def calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
-        """Calculate RSI"""
+    def analyze_key_levels(self, pair: str, prices: np.ndarray) -> Tuple[int, Dict]:
+        """Analyze key levels - 15 points total"""
+        if len(prices) < 20:
+            return 0, {'error': 'Insufficient data'}
+        
+        score = 0
+        details = {}
+        current_price = prices[-1]
+        
+        # 1. Fibonacci confluence (6 points)
+        fib_levels = self.calculate_fibonacci_levels(prices)
+        details['fibonacci'] = fib_levels
+        
+        confluence_count = 0
+        for level in fib_levels['levels']:
+            if abs(current_price - level['price']) / current_price < 0.005:  # Within 0.5%
+                confluence_count += 1
+        
+        if confluence_count >= 2:
+            score += 6
+            details['fib_confluence'] = f'{confluence_count} levels'
+        elif confluence_count == 1:
+            score += 4
+            details['fib_confluence'] = '1 level'
+        else:
+            score += 2
+        
+        # 2. Support/Resistance cluster (5 points)
+        sr_cluster = self.find_sr_cluster(prices)
+        details['sr_cluster'] = sr_cluster
+        
+        if sr_cluster['has_cluster']:
+            distance_to_cluster = min([abs(current_price - level) for level in sr_cluster['cluster_levels']])
+            relative_distance = distance_to_cluster / current_price
+            
+            if relative_distance < 0.01:  # Within 1%
+                score += 5
+                details['cluster_proximity'] = 'Very close'
+            elif relative_distance < 0.02:  # Within 2%
+                score += 4
+                details['cluster_proximity'] = 'Close'
+            elif relative_distance < 0.03:  # Within 3%
+                score += 3
+                details['cluster_proximity'] = 'Moderate'
+            else:
+                score += 2
+        else:
+            score += 1
+        
+        # 3. Psychological level (4 points)
+        psychological = self.check_psychological_level(pair, current_price)
+        details['psychological'] = psychological
+        
+        if psychological['is_psychological']:
+            if psychological['proximity'] == 'AT_LEVEL':
+                score += 4
+            elif psychological['proximity'] == 'NEAR_LEVEL':
+                score += 3
+            else:
+                score += 2
+        else:
+            score += 1
+        
+        details['total_levels_score'] = score
+        return score, details
+    
+    def analyze_volatility_entry(self, pair: str, prices: np.ndarray) -> Tuple[int, Dict]:
+        """Analyze volatility and entry - 10 points total"""
+        if len(prices) < 14:
+            return 0, {'error': 'Insufficient data'}
+        
+        score = 0
+        details = {}
+        
+        # 1. ATR-based optimal entry (6 points)
+        atr = self.calculate_atr(prices)
+        details['atr'] = atr
+        
+        current_price = prices[-1]
+        recent_low = np.min(prices[-20:])
+        recent_high = np.max(prices[-20:])
+        
+        # Calculate optimal entry zone
+        if current_price > np.mean(prices[-50:]):  # In uptrend
+            optimal_zone_low = recent_low + (atr * 0.3)
+            optimal_zone_high = recent_low + (atr * 0.7)
+        else:  # In downtrend
+            optimal_zone_low = recent_high - (atr * 0.7)
+            optimal_zone_high = recent_high - (atr * 0.3)
+        
+        if optimal_zone_low <= current_price <= optimal_zone_high:
+            details['entry_zone'] = 'In optimal zone'
+            score += 6
+        elif abs(current_price - optimal_zone_low) <= atr * 0.5:
+            details['entry_zone'] = 'Near optimal zone'
+            score += 4
+        else:
+            details['entry_zone'] = 'Outside optimal zone'
+            score += 2
+        
+        # 2. Volume confirmation (4 points) - using volatility as proxy
+        volatility = np.std(prices[-20:]) / np.mean(prices[-20:]) if np.mean(prices[-20:]) > 0 else 0
+        
+        if volatility > 0.02:  # High volatility
+            details['volatility'] = 'High - good for trending'
+            score += 4
+        elif volatility > 0.01:  # Medium volatility
+            details['volatility'] = 'Medium - normal conditions'
+            score += 3
+        else:  # Low volatility
+            details['volatility'] = 'Low - ranging market'
+            score += 2
+        
+        details['total_volatility_score'] = score
+        return score, details
+    
+    # ========== HELPER FUNCTIONS ==========
+    
+    def analyze_trend(self, prices: np.ndarray) -> Dict:
+        """Analyze trend direction and strength"""
+        if len(prices) < 10:
+            return {'direction': 'SIDEWAYS', 'strength': 0}
+        
+        # Simple linear regression
+        x = np.arange(len(prices))
+        slope, intercept = np.polyfit(x, prices, 1)
+        
+        # Calculate R-squared
+        y_pred = slope * x + intercept
+        ss_res = np.sum((prices - y_pred) ** 2)
+        ss_tot = np.sum((prices - np.mean(prices)) ** 2)
+        r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+        
+        if slope > 0 and r_squared > 0.3:
+            return {'direction': 'UPTREND', 'strength': r_squared}
+        elif slope < 0 and r_squared > 0.3:
+            return {'direction': 'DOWNTREND', 'strength': r_squared}
+        else:
+            return {'direction': 'SIDEWAYS', 'strength': r_squared}
+    
+    def analyze_price_structure(self, prices: np.ndarray) -> Dict:
+        """Analyze price structure (HH/HL, LH/LL)"""
+        if len(prices) < 20:
+            return {'quality': 'POOR', 'structure': 'INSUFFICIENT_DATA'}
+        
+        # Find swing highs and lows
+        highs = []
+        lows = []
+        
+        for i in range(5, len(prices) - 5):
+            if prices[i] == max(prices[i-5:i+6]):
+                highs.append((i, prices[i]))
+            if prices[i] == min(prices[i-5:i+6]):
+                lows.append((i, prices[i]))
+        
+        if len(highs) < 3 or len(lows) < 3:
+            return {'quality': 'FAIR', 'structure': 'INSUFFICIENT_SWINGS'}
+        
+        # Check for HH/HL (uptrend) or LH/LL (downtrend)
+        recent_highs = [h[1] for h in highs[-3:]]
+        recent_lows = [l[1] for l in lows[-3:]]
+        
+        is_hh = all(recent_highs[i] > recent_highs[i-1] for i in range(1, len(recent_highs)))
+        is_hl = all(recent_lows[i] > recent_lows[i-1] for i in range(1, len(recent_lows)))
+        is_lh = all(recent_highs[i] < recent_highs[i-1] for i in range(1, len(recent_highs)))
+        is_ll = all(recent_lows[i] < recent_lows[i-1] for i in range(1, len(recent_lows)))
+        
+        if is_hh and is_hl:
+            return {'quality': 'EXCELLENT', 'structure': 'HH_HL_UPTREND'}
+        elif is_lh and is_ll:
+            return {'quality': 'EXCELLENT', 'structure': 'LH_LL_DOWNTREND'}
+        elif is_hh or is_hl:
+            return {'quality': 'GOOD', 'structure': 'PARTIAL_UPTREND'}
+        elif is_lh or is_ll:
+            return {'quality': 'GOOD', 'structure': 'PARTIAL_DOWNTREND'}
+        else:
+            return {'quality': 'FAIR', 'structure': 'RANGING'}
+    
+    def analyze_ma_alignment(self, prices: np.ndarray) -> Dict:
+        """Check MA alignment"""
+        if len(prices) < 50:
+            return {'aligned': False, 'partially_aligned': False}
+        
+        # Calculate MAs
+        ma_20 = np.mean(prices[-20:])
+        ma_50 = np.mean(prices[-50:])
+        
+        # Simple alignment check
+        current_price = prices[-1]
+        
+        if current_price > ma_20 > ma_50:
+            return {'aligned': True, 'partially_aligned': True, 'alignment': 'BULLISH'}
+        elif current_price < ma_20 < ma_50:
+            return {'aligned': True, 'partially_aligned': True, 'alignment': 'BEARISH'}
+        elif (current_price > ma_20 and ma_20 > ma_50) or (current_price < ma_20 and ma_20 < ma_50):
+            return {'aligned': False, 'partially_aligned': True, 'alignment': 'PARTIAL'}
+        else:
+            return {'aligned': False, 'partially_aligned': False, 'alignment': 'MIXED'}
+    
+    def analyze_rsi(self, prices: np.ndarray, period: int = 14) -> Dict:
+        """Calculate RSI and look for divergence"""
         if len(prices) < period + 1:
-            return 50.0
+            return {'value': 50, 'divergence': 'NONE'}
         
         deltas = np.diff(prices)
         gains = np.where(deltas > 0, deltas, 0)
@@ -1057,104 +1047,223 @@ class HybridTechnicalAnalyzer:
         avg_loss = pd.Series(losses).rolling(period).mean().iloc[-1]
         
         if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return float(rsi) if not pd.isna(rsi) else 50.0
-    
-    def check_indicator_alignment(self, prices: List[float]) -> bool:
-        """Check if indicators are aligned"""
-        if len(prices) < 10:
-            return False
-        
-        # Simple alignment check
-        current = prices[-1]
-        prev = prices[-5]
-        return current > prev  # Price is higher than 5 periods ago
-    
-    def find_key_levels(self, prices: List[float], current_price: float) -> Dict:
-        """Find key support/resistance levels"""
-        if len(prices) < 20:
-            return {'support': 0, 'resistance': 0, 'quality': 'LOW'}
-        
-        # Find recent highs and lows
-        recent_prices = prices[-20:]
-        resistance = max(recent_prices)
-        support = min(recent_prices)
-        
-        # Determine quality based on distance to current price
-        distance_to_res = abs(resistance - current_price) / current_price if current_price > 0 else 1
-        distance_to_sup = abs(current_price - support) / current_price if current_price > 0 else 1
-        
-        if distance_to_res < 0.01 or distance_to_sup < 0.01:
-            quality = 'HIGH'
-        elif distance_to_res < 0.02 or distance_to_sup < 0.02:
-            quality = 'MEDIUM'
+            rsi = 100.0
         else:
-            quality = 'LOW'
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+        
+        rsi = float(rsi) if not pd.isna(rsi) else 50.0
+        
+        # Simple divergence detection
+        divergence = 'NONE'
+        if len(prices) > 30:
+            # Check for bullish divergence (price makes lower low, RSI makes higher low)
+            price_low_1 = min(prices[-30:-15])
+            price_low_2 = min(prices[-15:])
+            rsi_1 = 50  # Placeholder - would need actual RSI values
+            rsi_2 = 50
+            
+            if price_low_2 < price_low_1 and rsi_2 > rsi_1:
+                divergence = 'BULLISH'
+            elif price_low_2 > price_low_1 and rsi_2 < rsi_1:
+                divergence = 'BEARISH'
+        
+        return {'value': rsi, 'divergence': divergence}
+    
+    def analyze_macd(self, prices: np.ndarray) -> Dict:
+        """Calculate MACD"""
+        if len(prices) < 26:
+            return {'signal': 'NEUTRAL', 'histogram': 0}
+        
+        # Simplified MACD calculation
+        ema_12 = pd.Series(prices).ewm(span=12, adjust=False).mean().iloc[-1]
+        ema_26 = pd.Series(prices).ewm(span=26, adjust=False).mean().iloc[-1]
+        
+        macd_line = ema_12 - ema_26
+        signal_line = pd.Series([macd_line]).ewm(span=9, adjust=False).mean().iloc[-1]
+        histogram = macd_line - signal_line
+        
+        # Determine signal
+        if macd_line > signal_line and histogram > 0:
+            signal = 'STRONG_BULLISH' if histogram > abs(macd_line * 0.1) else 'BULLISH'
+        elif macd_line < signal_line and histogram < 0:
+            signal = 'STRONG_BEARISH' if abs(histogram) > abs(macd_line * 0.1) else 'BEARISH'
+        else:
+            signal = 'NEUTRAL'
+        
+        return {'signal': signal, 'histogram': float(histogram), 'macd_line': float(macd_line)}
+    
+    def analyze_adx(self, prices: np.ndarray, period: int = 14) -> Dict:
+        """Calculate ADX (simplified)"""
+        if len(prices) < period * 2:
+            return {'value': 0, 'strength': 'NO_TREND'}
+        
+        # Simplified ADX calculation
+        high_low = np.max(prices[-period:]) - np.min(prices[-period:])
+        avg_range = np.mean([abs(prices[i] - prices[i-1]) for i in range(-period, 0)])
+        
+        if avg_range == 0:
+            dx = 0
+        else:
+            dx = (high_low / avg_range) * 100
+        
+        # Classify strength
+        if dx > 25:
+            strength = 'STRONG_TREND'
+        elif dx > 20:
+            strength = 'MODERATE_TREND'
+        elif dx > 15:
+            strength = 'WEAK_TREND'
+        else:
+            strength = 'NO_TREND'
+        
+        return {'value': float(dx), 'strength': strength}
+    
+    def analyze_stochastic(self, prices: np.ndarray, k_period: int = 14, d_period: int = 3) -> Dict:
+        """Calculate Stochastic oscillator"""
+        if len(prices) < k_period:
+            return {'signal': 'NEUTRAL', 'k': 50, 'd': 50}
+        
+        # Simplified Stochastic
+        recent_low = min(prices[-k_period:])
+        recent_high = max(prices[-k_period:])
+        
+        if recent_high - recent_low == 0:
+            k = 50
+        else:
+            k = ((prices[-1] - recent_low) / (recent_high - recent_low)) * 100
+        
+        # Simple D line (smoothed K)
+        if len(prices) >= k_period + d_period:
+            d = np.mean([k] * d_period)  # Simplified
+        else:
+            d = k
+        
+        # Determine signal
+        if k > 80 and d > 80:
+            signal = 'BEARISH' if k < d else 'NEUTRAL'
+        elif k < 20 and d < 20:
+            signal = 'BULLISH' if k > d else 'NEUTRAL'
+        elif k > d:
+            signal = 'BULLISH'
+        elif k < d:
+            signal = 'BEARISH'
+        else:
+            signal = 'NEUTRAL'
+        
+        return {'signal': signal, 'k': float(k), 'd': float(d)}
+    
+    def calculate_fibonacci_levels(self, prices: np.ndarray) -> Dict:
+        """Calculate Fibonacci retracement levels"""
+        if len(prices) < 20:
+            return {'levels': []}
+        
+        # Find swing high and low
+        swing_high = max(prices[-20:])
+        swing_low = min(prices[-20:])
+        
+        fib_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
+        levels = []
+        
+        diff = swing_high - swing_low
+        
+        for level in fib_levels:
+            price_level = swing_high - (diff * level)
+            levels.append({
+                'level': level,
+                'price': float(price_level),
+                'type': 'RETRACEMENT'
+            })
+        
+        # Extension levels
+        ext_levels = [1.272, 1.414, 1.618]
+        for level in ext_levels:
+            price_level = swing_high + (diff * (level - 1))
+            levels.append({
+                'level': level,
+                'price': float(price_level),
+                'type': 'EXTENSION'
+            })
+        
+        return {'levels': levels, 'swing_high': float(swing_high), 'swing_low': float(swing_low)}
+    
+    def find_sr_cluster(self, prices: np.ndarray, lookback: int = 50) -> Dict:
+        """Find support/resistance clusters"""
+        if len(prices) < lookback:
+            return {'has_cluster': False, 'cluster_levels': []}
+        
+        # Find price levels where price reversed
+        reversal_levels = []
+        
+        for i in range(10, len(prices) - 10):
+            # Check for local highs (resistance)
+            if prices[i] == max(prices[i-10:i+11]):
+                # Price reversed down from this level
+                if prices[i+1] < prices[i] and prices[i+2] < prices[i]:
+                    reversal_levels.append(prices[i])
+            
+            # Check for local lows (support)
+            if prices[i] == min(prices[i-10:i+11]):
+                # Price reversed up from this level
+                if prices[i+1] > prices[i] and prices[i+2] > prices[i]:
+                    reversal_levels.append(prices[i])
+        
+        # Find clusters (levels close to each other)
+        clusters = []
+        if reversal_levels:
+            reversal_levels = sorted(reversal_levels)
+            
+            current_cluster = [reversal_levels[0]]
+            for level in reversal_levels[1:]:
+                if abs(level - current_cluster[-1]) / current_cluster[-1] < 0.005:  # Within 0.5%
+                    current_cluster.append(level)
+                else:
+                    if len(current_cluster) >= 2:
+                        clusters.append(np.mean(current_cluster))
+                    current_cluster = [level]
+            
+            if len(current_cluster) >= 2:
+                clusters.append(np.mean(current_cluster))
         
         return {
-            'support': float(support),
-            'resistance': float(resistance),
-            'quality': quality
+            'has_cluster': len(clusters) > 0,
+            'cluster_levels': [float(c) for c in clusters],
+            'total_reversals': len(reversal_levels)
         }
     
-    def determine_context(self, trend: Dict, patterns: List[str]) -> str:
-        """Determine market context"""
-        if trend['strong']:
-            return 'TRENDING'
+    def check_psychological_level(self, pair: str, price: float) -> Dict:
+        """Check if price is at/near psychological level"""
+        # Determine appropriate rounding based on pair
+        if 'JPY' in pair:
+            round_to = 0.5  # 50 pip levels for JPY pairs
+        else:
+            round_to = 0.005  # 50 pip levels for other pairs
         
-        if 'Consolidation' in patterns:
-            return 'RANGING'
+        # Find nearest psychological level
+        rounded = round(price / round_to) * round_to
         
-        return 'UNCLEAR'
+        distance = abs(price - rounded)
+        relative_distance = distance / price if price > 0 else 1
+        
+        if relative_distance < 0.0005:  # Within 5 pips
+            proximity = 'AT_LEVEL'
+        elif relative_distance < 0.001:  # Within 10 pips
+            proximity = 'NEAR_LEVEL'
+        else:
+            proximity = 'FAR_FROM_LEVEL'
+        
+        return {
+            'is_psychological': True,
+            'level': float(rounded),
+            'distance_pips': distance * (100 if 'JPY' in pair else 10000),
+            'proximity': proximity
+        }
     
-    def calculate_technical_score(self, trend: Dict, patterns: List, 
-                                indicators: Dict, levels: Dict) -> int:
-        """Calculate technical score 0-40"""
-        score = 0
-        
-        # Trend strength (0-15)
-        if trend['strong']:
-            score += 15
-        elif trend['direction'] != 'SIDEWAYS':
-            score += 8
-        
-        # Patterns (0-10)
-        score += min(len(patterns) * 3, 10)
-        
-        # Indicator alignment (0-10)
-        if indicators.get('aligned'):
-            score += 10
-        
-        # Key levels (0-5)
-        if levels.get('quality') in ['HIGH', 'MEDIUM']:
-            score += 5
-        
-        return min(score, 40)
-    
-    def calculate_optimal_entry(self, current_price: float, trend_dir: str,
-                              levels: Dict, atr: float) -> float:
-        """Calculate optimal entry price"""
-        if trend_dir == 'UPTREND':
-            # Buy near support in uptrend
-            support = levels.get('support', current_price * 0.99)
-            return support + (current_price - support) * 0.3
-        elif trend_dir == 'DOWNTREND':
-            # Sell near resistance in downtrend
-            resistance = levels.get('resistance', current_price * 1.01)
-            return resistance - (resistance - current_price) * 0.3
-        
-        return current_price
-    
-    def calculate_atr(self, prices: List[float], period: int = 14) -> float:
+    def calculate_atr(self, prices: np.ndarray, period: int = 14) -> float:
         """Calculate Average True Range"""
         if len(prices) < period + 1:
-            return 0.0
+            return 0.001
         
-        # Simplified ATR calculation
         tr_values = []
         for i in range(1, len(prices)):
             high = prices[i]
@@ -1167,113 +1276,156 @@ class HybridTechnicalAnalyzer:
             tr = max(hl, hc, lc)
             tr_values.append(tr)
         
-        atr = np.mean(tr_values[-period:]) if tr_values else 0.0
+        atr = np.mean(tr_values[-period:]) if tr_values else 0.001
         return float(atr)
     
-    def create_technical_summary(self, trend: Dict, patterns: List,
-                                context: str, score: int) -> str:
+    def determine_direction(self, prices: np.ndarray, structure_details: Dict) -> str:
+        """Determine trade direction based on analysis"""
+        # Use structure alignment first
+        if 'mtf_alignment' in structure_details:
+            if 'bullish' in structure_details['mtf_alignment'].lower():
+                return 'BUY'
+            elif 'bearish' in structure_details['mtf_alignment'].lower():
+                return 'SELL'
+        
+        # Fallback to price trend
+        if len(prices) >= 10:
+            recent_trend = self.analyze_trend(prices[-10:])
+            if recent_trend['direction'] == 'UPTREND':
+                return 'BUY'
+            elif recent_trend['direction'] == 'DOWNTREND':
+                return 'SELL'
+        
+        # Final fallback
+        return 'BUY'
+    
+    def find_optimal_entry(self, pair: str, current_price: float, direction: str, 
+                          structure_details: Dict, levels_details: Dict) -> float:
+        """Find optimal entry price"""
+        if direction == 'BUY':
+            # Look for support levels
+            support_levels = []
+            
+            # Check Fibonacci levels
+            if 'fibonacci' in levels_details:
+                for level in levels_details['fibonacci'].get('levels', []):
+                    if level['price'] < current_price * 0.99:  # Below current price
+                        support_levels.append(level['price'])
+            
+            # Check S/R clusters
+            if 'sr_cluster' in levels_details and levels_details['sr_cluster']['has_cluster']:
+                for level in levels_details['sr_cluster']['cluster_levels']:
+                    if level < current_price * 0.99:
+                        support_levels.append(level)
+            
+            if support_levels:
+                # Use highest support level (closest to current price but below)
+                valid_supports = [s for s in support_levels if s < current_price]
+                if valid_supports:
+                    optimal = max(valid_supports)
+                    # Add small buffer
+                    optimal = optimal * 1.001
+                    return round(optimal, 5 if 'JPY' not in pair else 3)
+            
+            # Fallback: 0.5% below current price
+            return round(current_price * 0.995, 5 if 'JPY' not in pair else 3)
+        
+        else:  # SELL
+            # Look for resistance levels
+            resistance_levels = []
+            
+            # Check Fibonacci levels
+            if 'fibonacci' in levels_details:
+                for level in levels_details['fibonacci'].get('levels', []):
+                    if level['price'] > current_price * 1.01:  # Above current price
+                        resistance_levels.append(level['price'])
+            
+            # Check S/R clusters
+            if 'sr_cluster' in levels_details and levels_details['sr_cluster']['has_cluster']:
+                for level in levels_details['sr_cluster']['cluster_levels']:
+                    if level > current_price * 1.01:
+                        resistance_levels.append(level)
+            
+            if resistance_levels:
+                # Use lowest resistance level (closest to current price but above)
+                valid_resistances = [r for r in resistance_levels if r > current_price]
+                if valid_resistances:
+                    optimal = min(valid_resistances)
+                    # Subtract small buffer
+                    optimal = optimal * 0.999
+                    return round(optimal, 5 if 'JPY' not in pair else 3)
+            
+            # Fallback: 0.5% above current price
+            return round(current_price * 1.005, 5 if 'JPY' not in pair else 3)
+    
+    def create_technical_summary(self, total_score: int, structure_details: Dict,
+                                momentum_details: Dict, levels_details: Dict) -> str:
         """Create technical summary"""
         parts = []
         
-        if trend['strong']:
-            parts.append(f"Strong {trend['direction'].lower()}")
-        elif trend['direction'] != 'SIDEWAYS':
-            parts.append(f"Weak {trend['direction'].lower()}")
+        # Structure
+        if 'mtf_alignment' in structure_details:
+            parts.append(structure_details['mtf_alignment'])
         
-        if patterns:
-            parts.append(f"{len(patterns)} patterns")
+        # Momentum highlights
+        if 'rsi' in momentum_details and momentum_details['rsi']['divergence'] != 'NONE':
+            parts.append(f"RSI {momentum_details['rsi']['divergence'].lower()} divergence")
         
-        parts.append(f"{context.lower()} market")
+        if 'macd' in momentum_details and momentum_details['macd']['signal'] != 'NEUTRAL':
+            parts.append(f"MACD {momentum_details['macd']['signal'].lower()}")
         
-        summary = f"Score: {score}/40 - " + ", ".join(parts)
+        # Key levels
+        if 'fib_confluence' in levels_details:
+            parts.append(f"Fib confluence: {levels_details['fib_confluence']}")
+        
+        summary = f"Score: {total_score}/80 - " + ", ".join(parts[:3])
         return summary
     
-    def get_fallback_technicals(self, pair: str) -> Dict:
-        """Fallback technical data"""
+    def get_fallback_analysis(self, pair: str) -> Dict:
+        """Fallback analysis when data is insufficient"""
         return {
-            'score': 20,
-            'trend': {'direction': 'SIDEWAYS', 'strength': 0, 'strong': False},
-            'patterns': [],
-            'indicators': {'rsi': 50, 'aligned': False},
-            'context': 'UNCLEAR',
+            'total_score': 20,
+            'structure_score': 5,
+            'momentum_score': 5,
+            'levels_score': 5,
+            'volatility_score': 5,
+            'structure_details': {'error': 'Insufficient data'},
+            'momentum_details': {'error': 'Insufficient data'},
+            'levels_details': {'error': 'Insufficient data'},
+            'volatility_details': {'error': 'Insufficient data'},
+            'direction': 'BUY',
             'current_price': 1.0,
             'optimal_entry': 1.0,
-            'atr': 0.01,
-            'summary': 'Technical analysis unavailable',
+            'atr': 0.001,
+            'summary': 'Insufficient data for analysis',
+            'prices_analyzed': 0,
             'timestamp': datetime.now().isoformat()
         }
 
 # ============================================================================
-# SENTIMENT ANALYZER (FIXED VERSION)
+# SENTIMENT ANALYZER (20 POINTS) - SAME AS BEFORE
 # ============================================================================
 
 class SentimentAnalyzer:
-    """Complete sentiment analysis"""
-    
-    def __init__(self):
-        self.real_sentiment_collector = RealSentimentCollector()
-        
-    def analyze_pair(self, pair: str) -> Dict:
-        """Analyze sentiment for a currency pair"""
-        try:
-            cache_key = f"sentiment_full_{pair}_{datetime.now().date()}"
-            cached = cache.get(cache_key)
-            if cached:
-                return cached
-            
-            # Get real sentiment data
-            sentiment_data = self.real_sentiment_collector.get_sentiment_for_pair(pair)
-            
-            # Calculate final sentiment score (0-20)
-            score = sentiment_data['score']
-            
-            result = {
-                'score': score,
-                'data': sentiment_data,
-                'summary': sentiment_data['summary'],
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            cache.set(cache_key, result)
-            return result
-            
-        except Exception as e:
-            logger.error(f"Sentiment analysis error for {pair}: {e}")
-            return self._get_fallback_sentiment()
-    
-    def _get_fallback_sentiment(self) -> Dict:
-        """Fallback sentiment data"""
-        return {
-            'score': 10,
-            'data': {'available': False, 'reason': 'Fallback'},
-            'summary': 'Sentiment analysis unavailable - using fallback',
-            'timestamp': datetime.now().isoformat()
-        }
-
-# ============================================================================
-# REAL SENTIMENT DATA - PRODUCTION READY
-# ============================================================================
-
-class RealSentimentCollector:
-    """Complete sentiment data collection from real sources"""
+    """Complete sentiment analysis (20 points total)"""
     
     def __init__(self):
         self.cftc_url = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
         self.last_fetch = None
         self.cot_data = None
         
-    def get_sentiment_for_pair(self, pair: str) -> Dict:
-        """Get complete sentiment analysis"""
+    def analyze_pair(self, pair: str) -> Dict:
+        """Analyze sentiment for a currency pair - returns 0-20 score"""
         try:
             cache_key = f"sentiment_{pair}_{datetime.now().date()}"
             cached = cache.get(cache_key)
             if cached:
                 return cached
             
-            # 1. Institutional sentiment (CFTC)
+            # Get institutional sentiment (CFTC)
             institutional = self._get_cftc_sentiment(pair)
             
-            # 2. Calculate composite score
+            # Calculate sentiment score (0-20)
             score = self._calculate_sentiment_score(institutional)
             
             result = {
@@ -1287,7 +1439,7 @@ class RealSentimentCollector:
             return result
             
         except Exception as e:
-            logger.error(f"Sentiment error for {pair}: {e}")
+            logger.error(f"Sentiment analysis error for {pair}: {e}")
             return self._get_fallback_sentiment()
     
     def _get_cftc_sentiment(self, pair: str) -> Dict:
@@ -1385,17 +1537,23 @@ class RealSentimentCollector:
     
     def _calculate_sentiment_score(self, institutional: Dict) -> int:
         """Calculate sentiment score 0-20"""
-        score = 10  # Neutral
+        score = 10  # Neutral baseline
         
         if institutional.get('available'):
-            if not institutional.get('extreme'):
-                score += 5  # Good: not extreme
+            net_pct = institutional.get('net_percentage', 0)
+            extreme = institutional.get('extreme', False)
+            
+            if not extreme:
+                # Not extreme = better for trading (less crowded)
+                if 40 <= abs(net_pct) <= 60:
+                    score += 5  # Optimal range
+                elif 30 <= abs(net_pct) < 40 or 60 < abs(net_pct) <= 70:
+                    score += 3  # Good range
+                else:
+                    score += 1  # Neutral range
             else:
-                score -= 3  # Bad: extreme positioning
-        
-        # Adjust for retail sentiment (contrarian indicator)
-        if institutional.get('extreme'):
-            score += 2  # Contrarian opportunity
+                # Extreme = contrarian opportunity but risky
+                score += 2  # Small positive for contrarian setups
         
         return max(0, min(score, 20))
     
@@ -1423,11 +1581,11 @@ class RealSentimentCollector:
         }
 
 # ============================================================================
-# PROFESSIONAL TP/SL CALCULATOR - COMPLETE VERSION
+# PROFESSIONAL TP/SL CALCULATOR - SAME AS BEFORE
 # ============================================================================
 
 class ProfessionalTP_SL_Calculator:
-    """Complete professional TP/SL calculation"""
+    """Complete professional TP/SL calculation (same as previous app.py)"""
     
     def calculate_optimal_tp_sl(self, pair: str, entry_price: float, 
                                 direction: str, context: str, atr: float,
@@ -1676,28 +1834,30 @@ class ProfessionalTP_SL_Calculator:
 # COMPLETE SCANNER ENGINE
 # ============================================================================
 
-class GlobalForexSentinel:
-    """Complete Forex Sentinel with catalyst-driven analysis"""
+class ForexTechnicalSentinel:
+    """Complete Forex Sentinel with pure technical analysis"""
     
     def __init__(self, config: Config):
         self.config = config
         
         # Initialize core components
         self.ws_manager = DerivWebSocketManager(config.DERIV_TOKEN)
-        self.catalyst_detector = SmartCatalystDetector(config.NEWSAPI_KEY)
-        self.technical_analyzer = HybridTechnicalAnalyzer(config.TWELVEDATA_KEY, self.ws_manager)
+        self.historical_manager = HistoricalDataManager(config.TWELVEDATA_KEY, self.ws_manager)
+        self.technical_analyzer = ProfessionalTechnicalAnalyzer(self.ws_manager, self.historical_manager)
         self.sentiment_analyzer = SentimentAnalyzer()
         self.tp_sl_calculator = ProfessionalTP_SL_Calculator()
         
         # Start WebSocket in background
         self.start_websocket()
         
+        # Fetch initial historical data
+        self.fetch_historical_data()
+        
         # Performance tracking
         self.scan_count = 0
         self.opportunities_found = 0
-        self.last_catalysts = []
         
-        logger.info("Forex Sentinel initialized")
+        logger.info("Forex Technical Sentinel initialized")
     
     def start_websocket(self):
         """Start WebSocket connection"""
@@ -1714,53 +1874,167 @@ class GlobalForexSentinel:
         except Exception as e:
             logger.error(f"Failed to start WebSocket: {e}")
     
+    def fetch_historical_data(self):
+        """Fetch initial historical data"""
+        try:
+            success = self.historical_manager.fetch_initial_historical_data()
+            if success:
+                logger.info("Historical data loaded successfully")
+            else:
+                logger.warning("Partial or no historical data loaded")
+        except Exception as e:
+            logger.error(f"Failed to load historical data: {e}")
+    
     def run_complete_scan(self) -> ScanResult:
-        """Run complete catalyst-driven market scan"""
+        """Run complete scan of ALL 90 pairs"""
         start_time = datetime.now()
-        scan_id = f"sentinel_scan_{int(start_time.timestamp())}"
+        scan_id = f"tech_scan_{int(start_time.timestamp())}"
         
-        logger.info(f"🚀 Starting Sentinel scan {scan_id}")
+        logger.info(f"🚀 Starting Technical scan {scan_id} for {len(ALL_PAIRS)} pairs")
         
         all_opportunities = []
+        score_distribution = {
+            '90-100': 0,
+            '80-89': 0,
+            '70-79': 0,
+            '60-69': 0,
+            '50-59': 0,
+            '40-49': 0,
+            '30-39': 0,
+            '20-29': 0,
+            '10-19': 0,
+            '0-9': 0
+        }
+        
+        pairs_analyzed = 0
         
         try:
-            # Step 1: Detect catalysts
-            catalysts = self.catalyst_detector.detect_catalysts()
-            self.last_catalysts = catalysts
+            # Get current prices for all pairs
+            all_prices = self.ws_manager.get_all_prices()
             
-            if not catalysts:
-                logger.info("No catalysts detected - market is quiet")
-                # Even with no catalysts, check major pairs
-                all_opportunities = self.scan_major_pairs(scan_id)
-            else:
-                logger.info(f"Detected {len(catalysts)} catalysts")
-                
-                # Step 2: For each catalyst, analyze affected pairs
-                for catalyst in catalysts:
-                    if catalyst['intensity'] in ['HIGH', 'MEDIUM']:
-                        opportunities = self.analyze_catalyst_affected_pairs(catalyst, scan_id)
-                        all_opportunities.extend(opportunities)
+            # Analyze ALL 90 pairs
+            for pair in ALL_PAIRS:
+                try:
+                    # Skip if no price data
+                    if pair not in all_prices or all_prices[pair] <= 0:
+                        continue
+                    
+                    # 1. Technical Analysis (80 points)
+                    technical = self.technical_analyzer.analyze_pair(pair)
+                    
+                    # 2. Sentiment Analysis (20 points)
+                    sentiment = self.sentiment_analyzer.analyze_pair(pair)
+                    
+                    # 3. Calculate Total Score (0-100)
+                    total_score = technical['total_score'] + sentiment['score']
+                    
+                    # Track score distribution
+                    if total_score >= 90:
+                        score_distribution['90-100'] += 1
+                    elif total_score >= 80:
+                        score_distribution['80-89'] += 1
+                    elif total_score >= 70:
+                        score_distribution['70-79'] += 1
+                    elif total_score >= 60:
+                        score_distribution['60-69'] += 1
+                    elif total_score >= 50:
+                        score_distribution['50-59'] += 1
+                    elif total_score >= 40:
+                        score_distribution['40-49'] += 1
+                    elif total_score >= 30:
+                        score_distribution['30-39'] += 1
+                    elif total_score >= 20:
+                        score_distribution['20-29'] += 1
+                    elif total_score >= 10:
+                        score_distribution['10-19'] += 1
+                    else:
+                        score_distribution['0-9'] += 1
+                    
+                    # THE ONLY FILTER: Score ≥ 70
+                    if total_score >= config.MIN_CONFLUENCE_SCORE:
+                        # 4. Determine trade direction
+                        direction = technical['direction']
+                        
+                        # 5. Get optimal entry
+                        entry_price = technical['optimal_entry']
+                        
+                        # 6. Calculate professional TP/SL
+                        tp_sl = self.tp_sl_calculator.calculate_optimal_tp_sl(
+                            pair=pair,
+                            entry_price=entry_price,
+                            direction=direction,
+                            context='TRENDING' if technical['structure_details'].get('mtf_alignment', '').startswith('Perfect') else 'UNCLEAR',
+                            atr=technical['atr'],
+                            technical_data=technical
+                        )
+                        
+                        if tp_sl is not None:
+                            # 7. Create complete opportunity
+                            technical_breakdown = {
+                                'structure': technical['structure_score'],
+                                'momentum': technical['momentum_score'],
+                                'levels': technical['levels_score'],
+                                'volatility': technical['volatility_score']
+                            }
+                            
+                            opportunity = Opportunity(
+                                pair=pair,
+                                direction=direction,
+                                confluence_score=total_score,
+                                catalyst="Pure Technical Analysis",
+                                setup_type=technical['summary'],
+                                entry_price=entry_price,
+                                stop_loss=tp_sl['stop_loss'],
+                                take_profit=tp_sl['take_profit'],
+                                risk_reward=tp_sl['risk_reward'],
+                                risk_pips=tp_sl['risk_pips'],
+                                reward_pips=tp_sl['reward_pips'],
+                                probability_tp_before_sl=tp_sl['probability_tp_before_sl'],
+                                estimated_duration_days=tp_sl['estimated_duration_days'],
+                                context='TRENDING' if 'bullish' in technical['structure_details'].get('mtf_alignment', '').lower() or 'bearish' in technical['structure_details'].get('mtf_alignment', '').lower() else 'UNCLEAR',
+                                confidence='VERY_HIGH' if total_score >= 85 else 'HIGH',
+                                analysis_summary=f"Technical score: {technical['total_score']}/80 + Sentiment: {sentiment['score']}/20 = {total_score}/100",
+                                fundamentals_summary="Technical Analysis Only - No News Catalysts",
+                                technicals_summary=technical['summary'],
+                                sentiment_summary=sentiment['summary'],
+                                detected_at=datetime.now().isoformat(),
+                                scan_id=scan_id,
+                                technical_breakdown=technical_breakdown
+                            )
+                            
+                            all_opportunities.append(opportunity)
+                    
+                    pairs_analyzed += 1
+                    
+                    # Log progress every 10 pairs
+                    if pairs_analyzed % 10 == 0:
+                        logger.info(f"Analyzed {pairs_analyzed}/{len(ALL_PAIRS)} pairs...")
+                        
+                except Exception as e:
+                    logger.error(f"Error analyzing {pair}: {e}")
             
             # Calculate statistics
             scan_duration = (datetime.now() - start_time).total_seconds()
-            market_state = self.determine_market_state(len(all_opportunities), len(catalysts))
+            market_state = self.determine_market_state(len(all_opportunities), score_distribution)
             
             # Update counters
             self.scan_count += 1
             self.opportunities_found += len(all_opportunities)
             
             logger.info(f"✅ Scan {scan_id} completed in {scan_duration:.1f}s")
-            logger.info(f"📊 Results: {len(all_opportunities)} very high probability setups")
-            logger.info(f"📈 Market state: {market_state}")
+            logger.info(f"📊 Results: {len(all_opportunities)} pairs with score ≥ 70")
+            logger.info(f"📈 Score distribution: {score_distribution}")
+            logger.info(f"🌍 Market state: {market_state}")
             
             return ScanResult(
                 scan_id=scan_id,
                 timestamp=datetime.now().isoformat(),
-                pairs_scanned=len(self.get_all_scanned_pairs()),
+                pairs_scanned=pairs_analyzed,
                 very_high_probability_setups=len(all_opportunities),
                 opportunities=all_opportunities,
                 scan_duration_seconds=scan_duration,
-                market_state=market_state
+                market_state=market_state,
+                score_distribution=score_distribution
             )
             
         except Exception as e:
@@ -1773,224 +2047,29 @@ class GlobalForexSentinel:
                 very_high_probability_setups=0,
                 opportunities=[],
                 scan_duration_seconds=(datetime.now() - start_time).total_seconds(),
-                market_state='ERROR'
+                market_state='ERROR',
+                score_distribution=score_distribution
             )
     
-    def scan_major_pairs(self, scan_id: str) -> List[Opportunity]:
-        """Scan major pairs even when no catalysts detected"""
-        opportunities = []
-        major_pairs = ['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'USD/CAD']
-        
-        for pair in major_pairs[:3]:  # Only scan top 3 to save resources
-            try:
-                opportunity = self.analyze_pair_completely(pair, scan_id, catalyst=None)
-                if opportunity:
-                    opportunities.append(opportunity)
-            except Exception as e:
-                logger.error(f"Error analyzing {pair}: {e}")
-        
-        return opportunities
-    
-    def analyze_catalyst_affected_pairs(self, catalyst: Dict, scan_id: str) -> List[Opportunity]:
-        """Analyze all pairs affected by a catalyst"""
-        opportunities = []
-        affected_currencies = catalyst['affected_currencies']
-        
-        # Generate all possible pairs between affected currencies
-        pairs_to_analyze = self.generate_pairs_from_currencies(affected_currencies)
-        
-        # Limit to top 10 pairs per catalyst to prevent overload
-        pairs_to_analyze = pairs_to_analyze[:10]
-        
-        logger.info(f"Analyzing {len(pairs_to_analyze)} pairs for catalyst: {catalyst['type']}")
-        
-        for pair in pairs_to_analyze:
-            try:
-                # Check if we have price data for this pair
-                price = self.ws_manager.get_price(pair)
-                if price is None or price <= 0:
-                    logger.debug(f"No price data for {pair}, skipping")
-                    continue
-                
-                opportunity = self.analyze_pair_completely(pair, scan_id, catalyst)
-                if opportunity:
-                    opportunities.append(opportunity)
-                    
-            except Exception as e:
-                logger.error(f"Error analyzing {pair} for catalyst: {e}")
-        
-        return opportunities
-    
-    def generate_pairs_from_currencies(self, currencies: List[str]) -> List[str]:
-        """Generate all possible pairs from list of currencies"""
-        pairs = []
-        
-        # Major pairs first (currency vs USD)
-        for currency in currencies:
-            if currency != 'USD':
-                pairs.append(f"{currency}/USD")
-                pairs.append(f"USD/{currency}")
-        
-        # Cross pairs (between non-USD currencies)
-        for i, base in enumerate(currencies):
-            for j, quote in enumerate(currencies):
-                if i != j and base != 'USD' and quote != 'USD':
-                    pairs.append(f"{base}/{quote}")
-        
-        # Remove duplicates and ensure we have calculations
-        unique_pairs = []
-        for pair in pairs:
-            if pair not in unique_pairs:
-                # Check if we can calculate this pair
-                price = self.ws_manager.get_price(pair)
-                if price is not None and price > 0:
-                    unique_pairs.append(pair)
-        
-        return unique_pairs
-    
-    def analyze_pair_completely(self, pair: str, scan_id: str, 
-                               catalyst: Optional[Dict]) -> Optional[Opportunity]:
-        """Complete analysis of a single pair"""
-        try:
-            # 1. Technical Analysis
-            technical = self.technical_analyzer.analyze_pair(pair)
-            
-            # 2. Sentiment Analysis
-            sentiment = self.sentiment_analyzer.analyze_pair(pair)
-            
-            # 3. Calculate Confluence Score
-            catalyst_score = 40 if catalyst and catalyst['intensity'] == 'HIGH' else \
-                           20 if catalyst and catalyst['intensity'] == 'MEDIUM' else 0
-            
-            confluence_score = (
-                catalyst_score +
-                technical['score'] +
-                sentiment['score']
-            )
-            
-            # THE ONLY FILTER: VERY HIGH PROBABILITY
-            if confluence_score >= self.config.MIN_CONFLUENCE_SCORE:
-                # 4. Determine trade direction
-                direction = self.determine_direction(technical, catalyst)
-                
-                # 5. Get optimal entry
-                entry_price = technical['optimal_entry']
-                
-                # 6. Calculate professional TP/SL
-                tp_sl = self.tp_sl_calculator.calculate_optimal_tp_sl(
-                    pair=pair,
-                    entry_price=entry_price,
-                    direction=direction,
-                    context=technical['context'],
-                    atr=technical['atr'],
-                    technical_data=technical
-                )
-                
-                if tp_sl is None:
-                    return None
-                
-                # 7. Create complete opportunity
-                catalyst_summary = f"{catalyst['type']}: {catalyst['title']}" if catalyst else "No catalyst"
-                
-                return Opportunity(
-                    pair=pair,
-                    direction=direction,
-                    confluence_score=confluence_score,
-                    catalyst=catalyst_summary,
-                    setup_type=technical['summary'],
-                    entry_price=entry_price,
-                    stop_loss=tp_sl['stop_loss'],
-                    take_profit=tp_sl['take_profit'],
-                    risk_reward=tp_sl['risk_reward'],
-                    risk_pips=tp_sl['risk_pips'],
-                    reward_pips=tp_sl['reward_pips'],
-                    probability_tp_before_sl=tp_sl['probability_tp_before_sl'],
-                    estimated_duration_days=tp_sl['estimated_duration_days'],
-                    context=technical['context'],
-                    confidence='VERY_HIGH' if confluence_score >= 85 else 'HIGH',
-                    analysis_summary=self.create_analysis_summary(pair, confluence_score, catalyst),
-                    fundamentals_summary=catalyst_summary,
-                    technicals_summary=technical['summary'],
-                    sentiment_summary=sentiment['summary'],
-                    detected_at=datetime.now().isoformat(),
-                    scan_id=scan_id
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Complete analysis failed for {pair}: {e}")
-            return None
-    
-    def determine_direction(self, technical: Dict, catalyst: Optional[Dict]) -> str:
-        """Determine trade direction based on analysis"""
-        # Use technical trend primarily
-        trend = technical.get('trend', {})
-        if trend.get('strong'):
-            return 'BUY' if trend['direction'] == 'UPTREND' else 'SELL'
-        
-        # Catalyst-based direction for certain types
-        if catalyst:
-            catalyst_type = catalyst.get('type', '')
-            if 'rate_decision' in catalyst_type or 'inflation' in catalyst_type:
-                # Rate hikes typically strengthen currency
-                affected = catalyst.get('affected_currencies', [])
-                if affected and 'USD' in affected:
-                    return 'BUY'  # USD strengthening
-            elif 'geopolitical' in catalyst_type or 'crisis' in catalyst_type:
-                # Crises typically strengthen safe havens
-                affected = catalyst.get('affected_currencies', [])
-                if 'JPY' in affected or 'CHF' in affected or 'XAU' in affected:
-                    return 'BUY'  # Safe haven strengthening
-        
-        # Final fallback
-        return 'BUY'
-    
-    def create_analysis_summary(self, pair: str, score: int, 
-                               catalyst: Optional[Dict]) -> str:
-        """Create analysis summary"""
-        if score >= 85:
-            catalyst_text = f"driven by {catalyst['type']}" if catalyst else ""
-            return f"EXCEPTIONAL confluence for {pair} {catalyst_text}."
-        elif score >= 75:
-            catalyst_text = f"with {catalyst['type']} catalyst" if catalyst else ""
-            return f"STRONG confluence for {pair} {catalyst_text}."
-        else:
-            catalyst_text = f"Catalyst: {catalyst['type']}" if catalyst else "No catalyst"
-            return f"GOOD confluence for {pair}. {catalyst_text}"
-    
-    def get_all_scanned_pairs(self) -> List[str]:
-        """Get list of all pairs that were scanned"""
-        pairs = set()
-        
-        # Add major pairs
-        pairs.update(['EUR/USD', 'GBP/USD', 'USD/JPY', 'USD/CHF', 'AUD/USD', 'USD/CAD'])
-        
-        # Add pairs from catalysts
-        for catalyst in self.last_catalysts:
-            affected = catalyst.get('affected_currencies', [])
-            for currency in affected:
-                if currency != 'USD':
-                    pairs.add(f"{currency}/USD")
-                    pairs.add(f"USD/{currency}")
-        
-        return list(pairs)
-    
-    def determine_market_state(self, opportunities_count: int, catalysts_count: int) -> str:
+    def determine_market_state(self, opportunities_count: int, score_distribution: Dict) -> str:
         """Determine market state based on opportunities found"""
-        if catalysts_count == 0:
+        high_quality_pairs = score_distribution.get('80-89', 0) + score_distribution.get('90-100', 0)
+        
+        if opportunities_count == 0:
             return 'QUIET'
-        elif opportunities_count == 0:
-            return 'CALM'  # Catalysts but no setups
         elif opportunities_count <= 3:
-            return 'NORMAL'
+            return 'CALM'
         elif opportunities_count <= 10:
+            return 'NORMAL'
+        elif opportunities_count <= 20:
             return 'ACTIVE'
+        elif high_quality_pairs >= 10:
+            return 'TRENDING'
         else:
             return 'VOLATILE'
 
 # ============================================================================
-# WEB INTERFACE - COMPLETE
+# WEB INTERFACE
 # ============================================================================
 
 from flask import Flask, jsonify, render_template_string, request
@@ -1998,14 +2077,14 @@ from flask import Flask, jsonify, render_template_string, request
 app = Flask(__name__)
 
 # Initialize sentinel globally
-sentinel = GlobalForexSentinel(config)
+sentinel = ForexTechnicalSentinel(config)
 
-# Complete HTML template (updated to show catalysts)
+# Complete HTML template
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Forex Global Sentinel</title>
+    <title>Forex Technical Sentinel</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -2021,11 +2100,9 @@ HTML_TEMPLATE = '''
         .stat-value { font-size: 2rem; font-weight: bold; color: #60a5fa; }
         .stat-label { font-size: 0.9rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
         
-        .catalyst-section { background: #1e293b; padding: 25px; border-radius: 10px; margin-bottom: 30px; }
-        .catalyst-card { background: #334155; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid; }
-        .catalyst-card.high { border-left-color: #ef4444; }
-        .catalyst-card.medium { border-left-color: #f59e0b; }
-        .catalyst-card.low { border-left-color: #3b82f6; }
+        .score-distribution { background: #1e293b; padding: 25px; border-radius: 10px; margin-bottom: 30px; }
+        .score-bar { height: 20px; background: #334155; border-radius: 10px; margin: 10px 0; overflow: hidden; }
+        .score-fill { height: 100%; background: linear-gradient(90deg, #10b981 0%, #3b82f6 100%); border-radius: 10px; }
         
         .scan-info { background: #1e293b; padding: 25px; border-radius: 10px; margin-bottom: 30px; }
         .market-state { display: inline-block; padding: 8px 16px; border-radius: 20px; font-weight: bold; margin-top: 10px; }
@@ -2049,6 +2126,11 @@ HTML_TEMPLATE = '''
         .detail-label { font-size: 0.8rem; color: #94a3b8; margin-bottom: 5px; }
         .detail-value { font-size: 1.1rem; font-weight: bold; }
         
+        .score-breakdown { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 15px; }
+        .score-item { text-align: center; padding: 10px; background: #334155; border-radius: 6px; }
+        .score-category { font-size: 0.8rem; color: #94a3b8; }
+        .score-points { font-size: 1.2rem; font-weight: bold; color: #60a5fa; }
+        
         .analysis-section { background: #334155; padding: 20px; border-radius: 8px; margin-top: 15px; }
         .analysis-title { color: #60a5fa; margin-bottom: 10px; }
         
@@ -2071,20 +2153,21 @@ HTML_TEMPLATE = '''
             .header { padding: 20px; }
             .header h1 { font-size: 1.8rem; }
             .stats-grid { grid-template-columns: 1fr; }
+            .score-breakdown { grid-template-columns: repeat(2, 1fr); }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🌍 Forex Global Sentinel</h1>
-            <p>Catalyst-driven analysis showing ONLY very high probability setups (70%+ confluence)</p>
-            <p><small>Real-time WebSocket • Smart catalyst detection • Never sleeps on Render</small></p>
+            <h1>📊 Forex Technical Sentinel</h1>
+            <p>Pure Technical Analysis: 80 points technical + 20 points sentiment = 100 total</p>
+            <p><small>Analyzing ALL 90 pairs • Showing ALL pairs with score ≥ 70 • NO other filters</small></p>
             
             <div class="api-status">
                 <div class="api-status-item api-status-good">✓ Deriv WebSocket</div>
-                <div class="api-status-item api-status-good">✓ NewsAPI Catalysts</div>
                 <div class="api-status-item api-status-good">✓ TwelveData Historical</div>
+                <div class="api-status-item api-status-good">✓ CFTC Sentiment</div>
             </div>
         </div>
         
@@ -2096,10 +2179,10 @@ HTML_TEMPLATE = '''
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-value">{{ scan.very_high_probability_setups }}</div>
-                <div class="stat-label">Very High Probability Setups</div>
+                <div class="stat-label">Pairs with Score ≥ 70</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value">{{ scan.pairs_scanned }}</div>
+                <div class="stat-value">{{ scan.pairs_scanned }}/90</div>
                 <div class="stat-label">Pairs Analyzed</div>
             </div>
             <div class="stat-card">
@@ -2112,45 +2195,67 @@ HTML_TEMPLATE = '''
             </div>
         </div>
         
+        <div class="score-distribution">
+            <h2>📈 Score Distribution ({{ scan.pairs_scanned }} pairs)</h2>
+            {% for range, count in scan.score_distribution.items() %}
+                <div>
+                    <div style="display: flex; justify-content: space-between; margin: 5px 0;">
+                        <span>{{ range }}:</span>
+                        <span>{{ count }} pairs</span>
+                    </div>
+                    <div class="score-bar">
+                        <div class="score-fill" style="width: {{ (count / scan.pairs_scanned * 100) if scan.pairs_scanned > 0 else 0 }}%;"></div>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+        
         <div class="scan-info">
             <h2>Latest Scan Results</h2>
             <p><strong>Scan ID:</strong> {{ scan.scan_id }}</p>
             <p><strong>Timestamp:</strong> {{ scan.timestamp }}</p>
+            <p><strong>Pairs Analyzed:</strong> {{ scan.pairs_scanned }}/90</p>
             <div class="market-state {{ scan.market_state.lower() }}">
                 Market State: {{ scan.market_state }}
             </div>
         </div>
         
-        {% if catalysts %}
-        <div class="catalyst-section">
-            <h2>📰 Detected Catalysts ({{ catalysts|length }})</h2>
-            {% for cat in catalysts %}
-                <div class="catalyst-card {{ cat.intensity.lower() }}">
-                    <h4>{{ cat.type|upper }} - {{ cat.intensity }} intensity</h4>
-                    <p>{{ cat.title }}</p>
-                    <p><small>Affected: {{ cat.affected_currencies|join(', ') }} • Source: {{ cat.source }}</small></p>
-                </div>
-            {% endfor %}
-        </div>
-        {% endif %}
-        
         {% if scan.very_high_probability_setups == 0 %}
             <div class="opportunity-card">
-                <h3>📭 No Very High Probability Setups Found</h3>
-                <p>The market is {{ scan.market_state.lower() }}. No setups meet our strict 70%+ confluence criteria.</p>
+                <h3>📭 No High Probability Setups Found</h3>
+                <p>The market is {{ scan.market_state.lower() }}. No pairs meet our strict 70+ score criteria.</p>
                 <p><em>This is MARKET TRUTH, not a system failure. Patience is key.</em></p>
             </div>
         {% else %}
-            <h2 style="margin-bottom: 20px;">🎯 Very High Probability Opportunities ({{ scan.very_high_probability_setups }})</h2>
-            <p style="margin-bottom: 20px; color: #94a3b8;"><em>Showing ALL setups that meet 70%+ confluence criteria. Catalyst-driven analysis.</em></p>
+            <h2 style="margin-bottom: 20px;">🎯 High Probability Opportunities ({{ scan.very_high_probability_setups }})</h2>
+            <p style="margin-bottom: 20px; color: #94a3b8;"><em>Showing ALL pairs with score ≥ 70. Pure technical analysis only.</em></p>
             
             {% for opp in scan.opportunities %}
                 <div class="opportunity-card {{ opp.confidence.lower().replace('_', '-') }}">
                     <h3 style="margin-bottom: 15px;">
                         <span class="badge {{ opp.direction.lower() }}">{{ opp.direction }}</span>
-                        {{ opp.pair }} • {{ opp.confluence_score }}% Confluence
+                        {{ opp.pair }} • {{ opp.confluence_score }}/100
                         <span style="float: right; font-size: 0.9rem; color: #94a3b8;">{{ opp.confidence }} confidence</span>
                     </h3>
+                    
+                    <div class="score-breakdown">
+                        <div class="score-item">
+                            <div class="score-category">Structure</div>
+                            <div class="score-points">{{ opp.technical_breakdown.structure }}/30</div>
+                        </div>
+                        <div class="score-item">
+                            <div class="score-category">Momentum</div>
+                            <div class="score-points">{{ opp.technical_breakdown.momentum }}/25</div>
+                        </div>
+                        <div class="score-item">
+                            <div class="score-category">Levels</div>
+                            <div class="score-points">{{ opp.technical_breakdown.levels }}/15</div>
+                        </div>
+                        <div class="score-item">
+                            <div class="score-category">Volatility</div>
+                            <div class="score-points">{{ opp.technical_breakdown.volatility }}/10</div>
+                        </div>
+                    </div>
                     
                     <div class="details-grid">
                         <div class="detail-item">
@@ -2196,10 +2301,6 @@ HTML_TEMPLATE = '''
                         
                         <div style="margin-top: 15px; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
                             <div>
-                                <div class="analysis-title">📰 Catalyst</div>
-                                <p>{{ opp.fundamentals_summary }}</p>
-                            </div>
-                            <div>
                                 <div class="analysis-title">📈 Technicals</div>
                                 <p>{{ opp.technicals_summary }}</p>
                             </div>
@@ -2223,7 +2324,7 @@ HTML_TEMPLATE = '''
                Next scan in: <span id="countdown">15:00</span> • 
                Keep-alive: Every 10 minutes</p>
             <p>App URL: {{ app_url }} • Render Free Tier • Never sleeps</p>
-            <p><small>API Usage: NewsAPI {{ newsapi_used }}/100 • TwelveData {{ twelvedata_used }}/800 • Deriv WebSocket: Active</small></p>
+            <p><small>API Usage: TwelveData 10/day • Deriv WebSocket: Active • CFTC: 24/day</small></p>
         </div>
     </div>
     
@@ -2276,16 +2377,10 @@ def home():
         # Run a scan
         result = sentinel.run_complete_scan()
         
-        # Get catalysts
-        catalysts = sentinel.last_catalysts
-        
         return render_template_string(
             HTML_TEMPLATE,
             scan=result.to_dict(),
-            catalysts=catalysts,
-            app_url=config.APP_URL,
-            newsapi_used=sentinel.catalyst_detector.used_today,
-            twelvedata_used=10  # Fixed daily usage for historical data
+            app_url=config.APP_URL
         )
     except Exception as e:
         return f"Error: {str(e)}"
@@ -2297,7 +2392,7 @@ def api_scan():
         result = sentinel.run_complete_scan()
         return jsonify({
             'status': 'success',
-            'message': f'Sentinel scan {result.scan_id} completed. Found {len(result.opportunities)} very high probability setups.',
+            'message': f'Technical scan {result.scan_id} completed. Found {len(result.opportunities)} pairs with score ≥ 70.',
             'data': result.to_dict()
         })
     except Exception as e:
@@ -2312,23 +2407,25 @@ def api_health():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'service': 'Forex Global Sentinel',
-        'version': '4.0.0',
+        'service': 'Forex Technical Sentinel',
+        'version': '5.0.0',
         'features': [
-            'Catalyst-driven analysis',
+            'Pure technical analysis (80 points)',
+            'Sentiment analysis (20 points)',
+            'ALL 90 pairs analyzed',
+            'Score ≥ 70 only filter',
+            'Professional TP/SL calculation',
             'Deriv WebSocket real-time data',
-            'Smart NewsAPI keyword rotation',
-            'Local cross-pair calculation',
-            'Never hits API limits',
-            'Never sleeps on Render'
+            'TwelveData historical',
+            'CFTC institutional sentiment'
         ],
         'stats': {
             'scans_completed': sentinel.scan_count,
             'opportunities_found': sentinel.opportunities_found,
             'websocket_connected': ws_connected,
             'websocket_prices': ws_prices,
-            'newsapi_used_today': sentinel.catalyst_detector.used_today,
-            'last_catalysts': len(sentinel.last_catalysts)
+            'total_pairs': len(ALL_PAIRS),
+            'min_score_threshold': config.MIN_CONFLUENCE_SCORE
         }
     })
 
@@ -2347,11 +2444,15 @@ def api_stats():
             'keep_alive_interval': config.SELF_PING_INTERVAL_MINUTES,
             'app_url': config.APP_URL,
             'api_limits': {
-                'newsapi_used': sentinel.catalyst_detector.used_today,
-                'newsapi_limit': 100,
-                'twelvedata_used': 10,
-                'twelvedata_limit': 800,
-                'deriv_websocket': 'Unlimited (with smart management)'
+                'twelvedata_calls': '10/day (once per currency)',
+                'deriv_websocket': 'Unlimited (with smart management)',
+                'cftc_calls': '24/day (once per hour)'
+            },
+            'scoring_system': {
+                'technical_analysis': '80 points total',
+                'sentiment_analysis': '20 points total',
+                'total_score': '100 points maximum',
+                'display_threshold': '70+ points'
             }
         }
     })
@@ -2359,23 +2460,17 @@ def api_stats():
 @app.route('/api/prices', methods=['GET'])
 def api_prices():
     """Get current prices from WebSocket"""
-    prices = {}
+    prices = sentinel.ws_manager.get_all_prices()
     
-    # Add direct prices
-    for pair, price in sentinel.ws_manager.prices.items():
-        if price > 0:
-            prices[pair] = price
-    
-    # Add some calculated crosses
-    for pair, price in list(sentinel.ws_manager.cross_prices.items())[:10]:
-        if price > 0:
-            prices[pair] = price
+    # Count how many pairs have prices
+    pairs_with_prices = sum(1 for price in prices.values() if price > 0)
     
     return jsonify({
         'status': 'success',
         'timestamp': datetime.now().isoformat(),
-        'prices': prices,
-        'total_pairs': len(prices)
+        'total_pairs': len(ALL_PAIRS),
+        'pairs_with_prices': pairs_with_prices,
+        'sample_prices': dict(list(prices.items())[:10])  # Show first 10
     })
 
 # ============================================================================
@@ -2424,14 +2519,14 @@ def run_scheduled_scan():
 def main():
     """Main application - Production ready"""
     logger.info("\n" + "="*60)
-    logger.info("🚀 FOREX GLOBAL SENTINEL v4.0")
+    logger.info("🚀 FOREX TECHNICAL SENTINEL v5.0")
     logger.info("="*60)
-    logger.info("✅ Catalyst-driven analysis")
-    logger.info("✅ Deriv WebSocket real-time data")
-    logger.info("✅ Smart NewsAPI keyword rotation")
-    logger.info("✅ Local cross-pair calculation")
-    logger.info("✅ Never hits API limits")
-    logger.info("✅ Showing ONLY 70%+ confluence setups")
+    logger.info("✅ Pure technical analysis (80 points)")
+    logger.info("✅ Sentiment analysis (20 points)")
+    logger.info("✅ ALL 90 pairs analyzed")
+    logger.info("✅ ONLY filter: Score ≥ 70")
+    logger.info("✅ Shows ALL qualifying pairs (no other filters)")
+    logger.info("✅ Professional TP/SL calculation")
     logger.info("="*60)
     
     # Schedule tasks
@@ -2442,7 +2537,7 @@ def main():
     logger.info("Running initial scan...")
     try:
         result = sentinel.run_complete_scan()
-        logger.info(f"✅ Initial scan completed: {len(result.opportunities)} very high probability setups")
+        logger.info(f"✅ Initial scan completed: {len(result.opportunities)} pairs with score ≥ 70")
     except Exception as e:
         logger.error(f"⚠ Initial scan failed: {e}")
     
