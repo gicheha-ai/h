@@ -56,7 +56,7 @@ class Config:
     ))
     
     # Scanner Settings
-    MIN_CONFLUENCE_SCORE: int = 70
+    MIN_CONFLUENCE_SCORE: int = 50
     SCAN_INTERVAL_MINUTES: int = 15
     MAX_PAIRS_PER_SCAN: int = 50
     
