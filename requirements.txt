@@ -3,6 +3,6 @@ pandas
 numpy
 requests
 schedule
-websocket-client
+websockets
 python-dotenv
 gunicorn
