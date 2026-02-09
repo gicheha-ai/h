@@ -6,3 +6,4 @@ schedule
 websockets
 python-dotenv
 gunicorn
+websocket-client
