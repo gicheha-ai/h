@@ -181,7 +181,6 @@ class Opportunity:
     pair: str
     direction: str
     confluence_score: int
-    catalyst: str = "Pure Technical Analysis"
     setup_type: str
     entry_price: float
     stop_loss: float
@@ -194,11 +193,12 @@ class Opportunity:
     context: str
     confidence: str
     analysis_summary: str
-    fundamentals_summary: str = "Technical Analysis Only - No News Catalysts"
     technicals_summary: str
     sentiment_summary: str
     detected_at: str
     scan_id: str
+    catalyst: str = "Pure Technical Analysis"
+    fundamentals_summary: str = "Technical Analysis Only - No News Catalysts"
     
     # Technical score breakdown
     technical_breakdown: Dict[str, int]
