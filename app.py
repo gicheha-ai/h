@@ -49,7 +49,7 @@ class Config:
         "TWELVEDATA_KEY", "2664b95fd52c490bb422607ef142e61f"
     ))
     NEWSAPI_KEY: str = field(default_factory=lambda: os.environ.get(
-        "NEWSAPI_KEY", "1aa9d2e514c9469495338f3cf20be563"
+        "NEWSAPI_KEY", "e973313ed2c142cb852101836f33a471"
     ))
     DERIV_TOKEN: str = field(default_factory=lambda: os.environ.get(
         "DERIV_TOKEN", "7LndOxnscxGr"
@@ -209,7 +209,7 @@ class ScanResult:
         }
 
 # ============================================================================
-# REAL-TIME DERIV WEB SOCKET MANAGER
+# REAL-TIME DERIV WEB SOCKET MANAGER - FIXED VERSION
 # ============================================================================
 
 class DerivWebSocketManager:
@@ -225,8 +225,8 @@ class DerivWebSocketManager:
         self.message_count = 0
         self.last_message_time = time.time()
         self.start_time = time.time()
-        self.loop = None
-        self.ws_task = None
+        self.running = False
+        self.ws_thread = None
         
         # Deriv symbol mapping
         self.symbol_map = {
@@ -255,15 +255,10 @@ class DerivWebSocketManager:
     def connect(self):
         """Establish WebSocket connection with smart batching"""
         try:
-            # Create new event loop in a new thread
-            def start_loop():
-                asyncio.set_event_loop(asyncio.new_event_loop())
-                self.loop = asyncio.get_event_loop()
-                self.loop.run_until_complete(self._async_connect())
-            
-            ws_thread = threading.Thread(target=start_loop)
-            ws_thread.daemon = True
-            ws_thread.start()
+            # Start WebSocket in background thread
+            self.running = True
+            self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
+            self.ws_thread.start()
             
             # Wait for connection
             for _ in range(10):
@@ -277,17 +272,22 @@ class DerivWebSocketManager:
             logger.error(f"Failed to connect to Deriv WebSocket: {e}")
             return False
     
-    async def _async_connect(self):
-        """Async connection handler"""
+    def _run_websocket(self):
+        """Run WebSocket in a thread"""
+        asyncio.run(self._async_websocket_handler())
+    
+    async def _async_websocket_handler(self):
+        """Async WebSocket handler using the working pattern"""
         try:
-            logger.info("Connecting to Deriv WebSocket...")
+            uri = f"wss://ws.derivws.com/websockets/v3?app_id=1089"
             
-            async with websockets.connect(config.DERIV_WS_URL) as ws:
-                self.ws = ws
+            async with websockets.connect(uri) as websocket:
+                self.ws = websocket
                 
-                # Authorize
-                await ws.send(json.dumps({"authorize": self.token}))
-                auth_response = await ws.recv()
+                # Step 1: Authorize
+                auth_msg = {"authorize": self.token}
+                await websocket.send(json.dumps(auth_msg))
+                auth_response = await websocket.recv()
                 auth_data = json.loads(auth_response)
                 
                 if "error" in auth_data:
@@ -295,81 +295,66 @@ class DerivWebSocketManager:
                     self.connected = False
                     return
                 
-                logger.info("✓ Deriv WebSocket authorized")
+                logger.info("✅ Deriv WebSocket authorized")
                 self.connected = True
                 
-                # Smart subscribe
-                await self.smart_subscribe_batch()
+                # Step 2: Subscribe to all symbols
+                symbols = list(self.symbol_map.values())
                 
-                # Start receiving messages
-                await self.receive_messages()
+                # Subscribe in batches
+                for i in range(0, len(symbols), config.WS_BATCH_SIZE):
+                    batch = symbols[i:i + config.WS_BATCH_SIZE]
+                    
+                    for symbol in batch:
+                        subscribe_msg = {"ticks": symbol, "subscribe": 1}
+                        await websocket.send(json.dumps(subscribe_msg))
+                        logger.debug(f"Subscribed to {symbol}")
+                        await asyncio.sleep(config.WS_PAIR_DELAY)
+                    
+                    # Wait between batches
+                    if i + config.WS_BATCH_SIZE < len(symbols):
+                        await asyncio.sleep(config.WS_BATCH_DELAY)
                 
+                # Step 3: Start receiving messages
+                while self.running:
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        self.message_count += 1
+                        self.last_message_time = time.time()
+                        
+                        data = json.loads(response)
+                        
+                        if "tick" in data:
+                            tick = data["tick"]
+                            symbol = tick.get("symbol")
+                            quote = tick.get("bid") or tick.get("quote") or 0
+                            
+                            if symbol and quote:
+                                # Convert Deriv symbol to standard pair name
+                                standard_pair = self.reverse_symbol_map.get(symbol)
+                                if standard_pair:
+                                    price = float(quote)
+                                    self.prices[standard_pair] = price
+                                    self.price_history[standard_pair].append(price)
+                                    
+                                    # Recalculate all crosses when we get new data
+                                    if len([p for p in self.prices.values() if p > 0]) >= 4:
+                                        self.calculate_all_crosses()
+                        
+                        elif "error" in data:
+                            logger.error(f"Deriv WebSocket error: {data['error']}")
+                            
+                    except asyncio.TimeoutError:
+                        # No data received, continue waiting
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing message: {e}")
+                        continue
+                        
         except Exception as e:
             logger.error(f"WebSocket connection error: {e}")
             self.connected = False
-    
-    async def smart_subscribe_batch(self):
-        """Smart batching subscription to prevent rate limits"""
-        await asyncio.sleep(1)  # Initial delay
-        
-        symbols = list(self.symbol_map.values())
-        
-        # Subscribe in batches
-        for i in range(0, len(symbols), config.WS_BATCH_SIZE):
-            batch = symbols[i:i + config.WS_BATCH_SIZE]
-            
-            for symbol in batch:
-                if self.connected and self.ws:
-                    subscribe_msg = {"ticks": symbol, "subscribe": 1}
-                    await self.ws.send(json.dumps(subscribe_msg))
-                    logger.debug(f"Subscribed to {symbol}")
-                    await asyncio.sleep(config.WS_PAIR_DELAY)
-            
-            # Wait between batches
-            if i + config.WS_BATCH_SIZE < len(symbols):
-                await asyncio.sleep(config.WS_BATCH_DELAY)
-    
-    async def receive_messages(self):
-        """Receive and process WebSocket messages"""
-        try:
-            while self.connected:
-                try:
-                    message = await asyncio.wait_for(self.ws.recv(), timeout=1.0)
-                    self.message_count += 1
-                    self.last_message_time = time.time()
-                    
-                    data = json.loads(message)
-                    
-                    # Handle tick data
-                    if "tick" in data:
-                        tick = data["tick"]
-                        symbol = tick.get("symbol")
-                        quote = tick.get("quote") or tick.get("bid") or 0
-                        
-                        if symbol and quote:
-                            # Convert Deriv symbol to standard pair name
-                            standard_pair = self.reverse_symbol_map.get(symbol)
-                            if standard_pair:
-                                price = float(quote)
-                                self.prices[standard_pair] = price
-                                self.price_history[standard_pair].append(price)
-                                
-                                # Recalculate all crosses when we get new data
-                                if len([p for p in self.prices.values() if p > 0]) >= 4:
-                                    self.calculate_all_crosses()
-                    
-                    # Handle errors
-                    elif "error" in data:
-                        logger.error(f"Deriv WebSocket error: {data['error']}")
-                        
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"Receive messages error: {e}")
+        finally:
             self.connected = False
     
     def calculate_all_crosses(self):
@@ -476,6 +461,10 @@ class DerivWebSocketManager:
     def reconnect(self):
         """Reconnect WebSocket"""
         logger.info("Reconnecting Deriv WebSocket...")
+        self.running = False
+        if self.ws_thread:
+            self.ws_thread.join(timeout=2)
+        time.sleep(2)
         self.connect()
     
     def monitor_and_maintain(self):
@@ -485,10 +474,7 @@ class DerivWebSocketManager:
                 # Check if we should restart (every 5 minutes)
                 if time.time() - self.start_time > config.WS_RECONNECT_INTERVAL:
                     logger.info("Restarting WebSocket for maintenance")
-                    self.connected = False
-                    time.sleep(2)
-                    self.start_time = time.time()
-                    self.connect()
+                    self.reconnect()
                 
                 # Check message rate
                 if self.last_message_time and time.time() - self.last_message_time > 30:
@@ -611,7 +597,7 @@ class SmartCatalystDetector:
                 self.used_today += 1
                 logger.debug(f"NewsAPI request #{self.used_today}: {endpoint}")
                 
-                # Cache for 1 hour - FIXED: removed ttl parameter
+                # Cache for 1 hour
                 cache.set(cache_key, data)
                 return data
             else:
@@ -885,7 +871,7 @@ class HybridTechnicalAnalyzer:
                 if data is not None:
                     self.historical_data[pair] = data
             
-            # Cache for 24 hours - FIXED: removed ttl parameter
+            # Cache for 24 hours
             cache.set(cache_key, self.historical_data)
             logger.info(f"Loaded historical data for {len(self.historical_data)} pairs")
             
